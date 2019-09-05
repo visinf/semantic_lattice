@@ -1,0 +1,2891 @@
+From a2723318f4ea2cd4a6d4f859a44160bcc355c02e Mon Sep 17 00:00:00 2001
+From: Martin Kiefel <mkiefel@amazon.com>
+Date: Tue, 1 May 2018 10:03:22 -0400
+Subject: [PATCH] Add permutohedral convolution
+
+---
+ src/operator/permutohedral-inl.h       | 1110 ++++++++++++++++++++++++++++++++
+ src/operator/permutohedral.cc          | 1073 ++++++++++++++++++++++++++++++
+ src/operator/permutohedral.cu          |  351 ++++++++++
+ tests/python/unittest/test_operator.py |  310 +++++++++
+ 4 files changed, 2844 insertions(+)
+ create mode 100644 src/operator/permutohedral-inl.h
+ create mode 100644 src/operator/permutohedral.cc
+ create mode 100644 src/operator/permutohedral.cu
+
+diff --git a/src/operator/permutohedral-inl.h b/src/operator/permutohedral-inl.h
+new file mode 100644
+index 0000000..460b59e
+--- /dev/null
++++ b/src/operator/permutohedral-inl.h
+@@ -0,0 +1,1110 @@
++// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#ifndef MXNET_OPERATOR_PERMUTOHEDRAL_INL_H_
++#define MXNET_OPERATOR_PERMUTOHEDRAL_INL_H_
++
++#include <cmath>
++#include <vector>
++
++#include <mxnet/operator_util.h>
++#include "elemwise_op_common.h"
++#include "mshadow_op.h"
++#include "mxnet_op.h"
++#include "operator_common.h"
++
++namespace mxnet {
++namespace op {
++
++using ::mshadow::NewTensor;
++using ::mshadow::FreeSpace;
++using ::mshadow::Shape;
++using ::mshadow::Shape1;
++using ::mshadow::Shape2;
++using ::mshadow::Shape3;
++using ::mshadow::Stream;
++using ::mshadow::Tensor;
++using ::mshadow::expr::scalar;
++
++namespace permutohedral {
++namespace lattice {
++enum Inputs { kFeatures, kNumInputs };
++enum Outputs { kBarycentric, kOffset, kBlurNeighbors, kRank, kNumOutputs };
++}  // namespace lattice
++
++namespace splat {
++enum Inputs { kDataIn, kBarycentric, kOffset, kNumInputs };
++enum Outputs { kDataOut, kNumOutputs };
++}  // namespace splat
++
++namespace slice {
++enum Inputs { kDataIn, kBarycentric, kOffset, kNumInputs };
++enum Outputs { kDataOut, kNumOutputs };
++}  // namespace slice
++
++namespace convolve {
++enum Inputs { kDataIn, kWeight, kBlurNeighbors, kNumInputs };
++enum Outputs { kDataOut, kNumOutputs };
++}  // namespace convolve
++}  // namespace permutohedral
++
++// Returns the number of elements in a permutohedral filter with a given
++// 'neighborhood_size' in 'feature_size' dimensional space.
++inline int get_filter_size(int neighborhood_size, int feature_size) {
++  return std::pow(neighborhood_size + 1, feature_size + 1) -
++         std::pow(neighborhood_size, feature_size + 1);
++}
++
++template <typename xpu, typename DType>
++void build_lattice(const Tensor<xpu, 2, DType>& features,
++                   int neighborhood_size,
++                   Tensor<xpu, 2, int32_t> rank,
++                   Tensor<xpu, 2, DType> barycentric,
++                   Tensor<xpu, 2, int32_t> offset,
++                   Tensor<xpu, 2, int32_t> blur_neighbors);
++
++template <typename xpu, typename DType>
++void build_lattice_tick(const Tensor<xpu, 2, int32_t>& rank,
++                        const Tensor<xpu, 2, DType>& gradient_barycentric,
++                        Tensor<xpu, 2, DType> gradient_features);
++
++template <typename xpu, typename DType>
++void splat(const Tensor<xpu, 2, DType>& in,
++           const index_t in_offset,
++           const Tensor<xpu, 2, DType>& barycentric,
++           const Tensor<xpu, 2, int32_t>& offset,
++           Tensor<xpu, 2, DType> splatted);
++
++template <typename xpu, typename DType>
++void splat_tick(const Tensor<xpu, 2, DType>& in,
++                const Tensor<xpu, 2, DType>& gradient_splatted,
++                const index_t in_offset,
++                const Tensor<xpu, 2, DType>& barycentric,
++                const Tensor<xpu, 2, int32_t>& offset,
++                Tensor<xpu, 2, DType> gradient_barycentric,
++                Tensor<xpu, 2, DType> gradient_in);
++
++template <typename xpu, typename DType>
++void splat_tick_barycentric(const Tensor<xpu, 2, DType>& in,
++                            const Tensor<xpu, 2, DType>& gradient_splatted,
++                            const index_t in_offset,
++                            const Tensor<xpu, 2, DType>& barycentric,
++                            const Tensor<xpu, 2, int32_t>& offset,
++                            Tensor<xpu, 2, DType> gradient_barycentric);
++
++template <typename xpu, typename DType>
++void splat_tick_data(const Tensor<xpu, 2, DType>& in,
++                     const Tensor<xpu, 2, DType>& gradient_splatted,
++                     const index_t in_offset,
++                     const Tensor<xpu, 2, DType>& barycentric,
++                     const Tensor<xpu, 2, int32_t>& offset,
++                     Tensor<xpu, 2, DType> gradient_in);
++
++template <typename xpu, typename DType>
++void slice(const Tensor<xpu, 2, DType>& data,
++           const int out_offset,
++           const Tensor<xpu, 2, DType>& barycentric,
++           const Tensor<xpu, 2, int32_t>& offset,
++           Tensor<xpu, 2, DType> sliced);
++
++template <typename xpu, typename DType>
++void slice_tick(const Tensor<xpu, 2, DType>& data,
++                const Tensor<xpu, 2, DType>& gradient_sliced,
++                const int out_offset,
++                const Tensor<xpu, 2, DType>& barycentric,
++                const Tensor<xpu, 2, int32_t>& offset,
++                Tensor<xpu, 2, DType> gradient_barycentric,
++                Tensor<xpu, 2, DType> gradient_data);
++
++template <typename xpu, typename DType>
++void slice_tick_barycentric(const Tensor<xpu, 2, DType>& data,
++                            const Tensor<xpu, 2, DType>& gradient_sliced,
++                            const int out_offset,
++                            const Tensor<xpu, 2, int32_t>& offset,
++                            Tensor<xpu, 2, DType> gradient_barycentric);
++
++template <typename xpu, typename DType>
++void slice_tick_data(const Tensor<xpu, 2, DType>& gradient_sliced,
++                     const int out_offset,
++                     const Tensor<xpu, 2, DType>& barycentric,
++                     const Tensor<xpu, 2, int32_t>& offset,
++                     Tensor<xpu, 2, DType> gradient_data);
++
++template <typename xpu, typename DType>
++void blur(const Tensor<xpu, 2, DType>& splatted,
++          const Tensor<xpu, 3, DType>& filter,
++          const Tensor<xpu, 2, int32_t>& blur_neighbors,
++          Tensor<xpu, 2, DType> col_data,
++          Tensor<xpu, 2, DType> blurred,
++          Stream<xpu>* s);
++
++template <typename xpu, typename DType>
++void blur_tick(const Tensor<xpu, 2, DType>& splatted,
++               const Tensor<xpu, 2, DType>& gradient_blurred,
++               const Tensor<xpu, 3, DType>& filter,
++               const Tensor<xpu, 2, int32_t>& blur_neighbors,
++               Tensor<xpu, 2, DType> col_data,
++               Tensor<xpu, 3, DType> gradient_filter,
++               Tensor<xpu, 2, DType> gradient_splatted,
++               Stream<xpu>* s);
++
++template <typename xpu, typename DType>
++void blur_tick_weight(const Tensor<xpu, 2, DType>& splatted,
++                      const Tensor<xpu, 2, DType>& gradient_blurred,
++                      const Tensor<xpu, 3, DType>& filter,
++                      const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                      Tensor<xpu, 2, DType> col_data,
++                      Tensor<xpu, 3, DType> gradient_filter,
++                      Stream<xpu>* s);
++
++template <typename xpu, typename DType>
++void blur_tick_data(const Tensor<xpu, 2, DType>& splatted,
++                    const Tensor<xpu, 2, DType>& gradient_blurred,
++                    const Tensor<xpu, 3, DType>& filter,
++                    const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                    Tensor<xpu, 2, DType> col_data,
++                    Tensor<xpu, 2, DType> gradient_splatted,
++                    Stream<xpu>* s);
++
++template <typename xpu, typename DType>
++void compute(const Tensor<xpu, 2, DType>& in,
++             const index_t in_offset,
++             const index_t out_offset,
++             const Tensor<xpu, 3, DType>& filter,
++             const Tensor<xpu, 2, DType>& barycentric,
++             const Tensor<xpu, 2, int32_t>& offset,
++             const Tensor<xpu, 2, int32_t>& blur_neighbors,
++             Tensor<xpu, 2, DType> splatted,
++             Tensor<xpu, 2, DType> blurred,
++             Tensor<xpu, 2, DType> col_data,
++             Tensor<xpu, 2, DType> out,
++             Stream<xpu>* s);
++
++template <typename xpu, typename DType>
++void compute_tick(const Tensor<xpu, 2, DType>& in,
++                  const index_t in_offset,
++                  const index_t out_offset,
++                  const Tensor<xpu, 3, DType>& filter,
++                  const Tensor<xpu, 2, DType>& barycentric,
++                  const Tensor<xpu, 2, int32_t>& offset,
++                  const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                  const Tensor<xpu, 2, DType>& gradient_out,
++                  Tensor<xpu, 2, DType> gradient_barycentric,
++                  Tensor<xpu, 2, DType> gradient_splatted,
++                  Tensor<xpu, 2, DType> gradient_blurred,
++                  Tensor<xpu, 2, DType> col_data,
++                  Tensor<xpu, 3, DType> gradient_filter,
++                  Tensor<xpu, 2, DType> gradient_in,
++                  Stream<xpu>* s);
++
++// Gathers all parameters that describe a permutohedral lattice.
++struct PermutohedralLatticeParam
++    : public dmlc::Parameter<PermutohedralLatticeParam> {
++  int neighborhood_size;
++  int lattice_size;
++  DMLC_DECLARE_PARAMETER(PermutohedralLatticeParam) {
++    DMLC_DECLARE_FIELD(neighborhood_size).describe("size of filter");
++    DMLC_DECLARE_FIELD(lattice_size).describe("size of lattice");
++  }
++};
++
++// Gathers all parameters that describe a splatting operation.
++struct PermutohedralSplatParam
++    : public dmlc::Parameter<PermutohedralSplatParam> {
++  int features_in_offset;
++  int features_in_size;
++  int lattice_size;
++  DMLC_DECLARE_PARAMETER(PermutohedralSplatParam) {
++    DMLC_DECLARE_FIELD(features_in_offset)
++        .describe("index offset of features_in");
++    DMLC_DECLARE_FIELD(features_in_size)
++        .describe("index length of features_in");
++    DMLC_DECLARE_FIELD(lattice_size).describe("size of lattice");
++  }
++};
++
++// Gathers all parameters that describe a slicing operation.
++struct PermutohedralSliceParam
++    : public dmlc::Parameter<PermutohedralSliceParam> {
++  int features_out_offset;
++  int features_out_size;
++  DMLC_DECLARE_PARAMETER(PermutohedralSliceParam) {
++    DMLC_DECLARE_FIELD(features_out_offset)
++        .describe("index offset of features_out");
++    DMLC_DECLARE_FIELD(features_out_size)
++        .describe("index length of features_out");
++  }
++};
++
++// Gathers all parameters that describe a permutohedral convolution.
++struct PermutohedralConvolveParam
++    : public dmlc::Parameter<PermutohedralConvolveParam> {
++  int num_filter;
++  int groups;
++  DMLC_DECLARE_PARAMETER(PermutohedralConvolveParam) {
++    DMLC_DECLARE_FIELD(num_filter).describe("number of convolution filters");
++    DMLC_DECLARE_FIELD(groups).describe("number of convolution groups");
++  }
++};
++
++// Infers shape of outputs based on parameters and input. Verifies that passed
++// parameter are valid for the passed size of the operands.
++inline bool PermutohedralLatticeShape(const nnvm::NodeAttrs& attrs,
++                                      std::vector<TShape>* const in_attrs,
++                                      std::vector<TShape>* const out_attrs) {
++  const PermutohedralLatticeParam& parameter =
++      nnvm::get<PermutohedralLatticeParam>(attrs.parsed);
++
++  CHECK_EQ(in_attrs->size(), permutohedral::lattice::kNumInputs)
++      << "Input:[features]";
++  CHECK_EQ(out_attrs->size(), permutohedral::lattice::kNumOutputs)
++      << "Output:[barycentric, offset, blur_neighbors]";
++
++  const TShape& features_shape = (*in_attrs)[permutohedral::lattice::kFeatures];
++
++  if (features_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(features_shape.ndim(), 3U)
++      << "Dimensions: features should be 3D in batch-feature_dim-x.";
++
++  // Set output shapes
++  Shape<3> barycentric_shape =
++      Shape3(features_shape[0], features_shape[1], features_shape[2] + 1);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::lattice::kBarycentric,
++                     barycentric_shape);
++  // The shape of the lattice offsets is equal to the barycentric coordinates.
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::lattice::kOffset,
++                     barycentric_shape);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::lattice::kRank,
++                     barycentric_shape);
++
++  // At this point the shape of the lattice is unknown. We trust the user here
++  // to pass a lattice size that makes sense.
++  int neighbors =
++      get_filter_size(parameter.neighborhood_size, features_shape[2]) - 1;
++  // TODO(mkiefel): Check if there is a way to allow empty tensors.
++  // To avoid empty tensors we need to allocate at least one element per lattice
++  // point.
++  if (neighbors == 0) {
++    ++neighbors;
++  }
++  Shape<3> blur_neighbors_shape =
++      Shape3(features_shape[0], parameter.lattice_size, neighbors);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::lattice::kBlurNeighbors,
++                     blur_neighbors_shape);
++
++  return true;
++}
++
++// Infers shape of outputs based on parameters and input. Verifies that passed
++// parameter are valid for the passed size of the operands.
++inline bool PermutohedralSplatShape(const nnvm::NodeAttrs& attrs,
++                                    std::vector<TShape>* const in_attrs,
++                                    std::vector<TShape>* const out_attrs) {
++  const PermutohedralSplatParam& parameter =
++      nnvm::get<PermutohedralSplatParam>(attrs.parsed);
++
++  CHECK_EQ(in_attrs->size(), permutohedral::splat::kNumInputs)
++      << "Input:[data_in, barycentric, offset]";
++  CHECK_EQ(out_attrs->size(), permutohedral::splat::kNumOutputs)
++      << "Output:[data_out]";
++
++  const TShape& data_in_shape = (*in_attrs)[permutohedral::splat::kDataIn];
++  const TShape& barycentric_shape =
++      (*in_attrs)[permutohedral::splat::kBarycentric];
++  const TShape& offset_shape = (*in_attrs)[permutohedral::splat::kOffset];
++
++  if (data_in_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(data_in_shape.ndim(), 3U)
++      << "Dimensions: data should be 3D in batch-num_filter-x.";
++  if (barycentric_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(barycentric_shape.ndim(), 3U)
++      << "Dimensions: barycentric should be 3D in batch-x-(num_features+1).";
++  if (offset_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(offset_shape.ndim(), 3U)
++      << "Dimensions: offset should be 3D in batch-x-(num_features+1).";
++
++  // Check that barycentric and offset have the same size.
++  SHAPE_ASSIGN_CHECK(*in_attrs, permutohedral::splat::kBarycentric,
++                     offset_shape);
++
++  // Check that the batch size matches.
++  CHECK_EQ(data_in_shape[0], barycentric_shape[0])
++      << "Shape: data_in and barycentric/offset should have the same batch "
++         "size.";
++
++  // The input feature size needs to match the data size. Each of the
++  // in-features describes the location of one input data point.
++  CHECK_EQ(data_in_shape[2], parameter.features_in_size)
++      << "Shape: features_in_size should have the same length as data_in.";
++
++  // Verify that the features' shape makes sense with respect to the passed
++  // parameters.
++  CHECK_GE(parameter.features_in_offset, 0)
++      << "Parameter: features_in_offset must be a valid positive index "
++         "offset.";
++  CHECK_GE(parameter.features_in_size, 0)
++      << "Parameter: features_in_size must be a valid positive index "
++         "length.";
++
++  CHECK_LE(parameter.features_in_offset + parameter.features_in_size,
++           barycentric_shape[1])
++      << "Parameter: features_in_offset + features_in_size must lie "
++         "completely inside the features array.";
++
++  Shape<3> data_out_shape =
++      Shape3(data_in_shape[0], data_in_shape[1], parameter.lattice_size + 1);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::splat::kDataOut,
++                     data_out_shape);
++
++  return true;
++}
++
++// Infers shape of outputs based on parameters and input. Verifies that passed
++// parameter are valid for the passed size of the operands.
++inline bool PermutohedralSliceShape(const nnvm::NodeAttrs& attrs,
++                                    std::vector<TShape>* const in_attrs,
++                                    std::vector<TShape>* const out_attrs) {
++  const PermutohedralSliceParam& parameter =
++      nnvm::get<PermutohedralSliceParam>(attrs.parsed);
++
++  CHECK_EQ(in_attrs->size(), permutohedral::slice::kNumInputs)
++      << "Input:[data_in, barycentric, offset]";
++  CHECK_EQ(out_attrs->size(), permutohedral::slice::kNumOutputs)
++      << "Output:[data_out]";
++
++  const TShape& data_in_shape = (*in_attrs)[permutohedral::slice::kDataIn];
++  const TShape& barycentric_shape =
++      (*in_attrs)[permutohedral::slice::kBarycentric];
++  const TShape& offset_shape = (*in_attrs)[permutohedral::slice::kOffset];
++
++  if (data_in_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(data_in_shape.ndim(), 3U) << "Dimensions: data should be 3D in "
++                                        "batch-num_filter-(lattice_size + 1).";
++  if (barycentric_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(barycentric_shape.ndim(), 3U)
++      << "Dimensions: barycentric should be 3D in batch-x-(num_features+1).";
++  if (offset_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(offset_shape.ndim(), 3U)
++      << "Dimensions: offset should be 3D in batch-x-(num_features+1).";
++
++  // Check that barycentric and offset have the same size.
++  SHAPE_ASSIGN_CHECK(*in_attrs, permutohedral::slice::kBarycentric,
++                     offset_shape);
++
++  // Check that the batch size matches.
++  CHECK_EQ(data_in_shape[0], barycentric_shape[0])
++      << "Shape: data_in and barycentric/offset should have the same batch "
++         "size.";
++
++  // Verify that the features' shape makes sense with respect to the passed
++  // parameters.
++  CHECK_GE(parameter.features_out_offset, 0)
++      << "Parameter: features_out_offset must be a valid positive index "
++         "offset.";
++  CHECK_GE(parameter.features_out_size, 0)
++      << "Parameter: features_out_size must be a valid positive index "
++         "length.";
++
++  CHECK_LE(parameter.features_out_offset + parameter.features_out_size,
++           barycentric_shape[1])
++      << "Parameter: features_out_offset + features_out_size must lie "
++         "completely inside the features array.";
++
++  Shape<3> data_out_shape =
++      Shape3(data_in_shape[0], data_in_shape[1], parameter.features_out_size);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::slice::kDataOut,
++                     data_out_shape);
++
++  return true;
++}
++
++// Infers shape of outputs based on parameters and input. Verifies that passed
++// parameter are valid for the passed size of the operands.
++inline bool PermutohedralConvolveShape(const nnvm::NodeAttrs& attrs,
++                                       std::vector<TShape>* const in_attrs,
++                                       std::vector<TShape>* const out_attrs) {
++  const PermutohedralConvolveParam& parameter =
++      nnvm::get<PermutohedralConvolveParam>(attrs.parsed);
++
++  CHECK_EQ(in_attrs->size(), permutohedral::convolve::kNumInputs)
++      << "Input:[data_in, filter, blur_neighbors]";
++  CHECK_EQ(out_attrs->size(), permutohedral::convolve::kNumOutputs)
++      << "Output:[data_out]";
++
++  const TShape& data_in_shape = (*in_attrs)[permutohedral::convolve::kDataIn];
++  const TShape& blur_neighbors_shape =
++      (*in_attrs)[permutohedral::convolve::kBlurNeighbors];
++
++  if (data_in_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(data_in_shape.ndim(), 3U)
++      << "Dimensions: data should be 3D in batch-num_filter-(lattice_size+1).";
++
++  if (blur_neighbors_shape.ndim() == 0) {
++    return false;
++  }
++  CHECK_EQ(blur_neighbors_shape.ndim(), 3U)
++      << "Dimensions: features should be 3D in batch-lattice_size-neighbors.";
++
++  // This is a different way to look at the more natural
++  // Shape3(parameter.num_filter, data_in_shape[1] / parameter.groups,
++  // get_filter_size(parameter.neighborhood_size, features_shape[1])). However,
++  // this is allows to index by filter group in the first dimension.
++  int neighbors = blur_neighbors_shape[2];
++  // Revert fix to avoid empty tensor in blur_neighbors.
++  if (neighbors == 1) {
++    --neighbors;
++  }
++  Shape<3> weight_shape =
++      Shape3(parameter.groups, parameter.num_filter / parameter.groups,
++             data_in_shape[1] / parameter.groups * (neighbors + 1));
++  SHAPE_ASSIGN_CHECK(*in_attrs, permutohedral::convolve::kWeight, weight_shape);
++
++  // Check that the batch size matches.
++  CHECK_EQ(data_in_shape[0], blur_neighbors_shape[0]);
++
++  // Check that the lattice size matches.
++  CHECK_EQ(data_in_shape[2], blur_neighbors_shape[1] + 1);
++
++  Shape<3> data_out_shape =
++      Shape3(data_in_shape[0], parameter.num_filter, data_in_shape[2]);
++  SHAPE_ASSIGN_CHECK(*out_attrs, permutohedral::convolve::kDataOut,
++                     data_out_shape);
++
++  return true;
++}
++
++// Infers underlying data type for the involved tensors.
++inline bool PermutohedralLatticeType(const nnvm::NodeAttrs& attrs,
++                                     std::vector<int>* in_attrs,
++                                     std::vector<int>* out_attrs) {
++  CHECK_EQ(in_attrs->size(), permutohedral::lattice::kNumInputs);
++  CHECK_EQ(out_attrs->size(), permutohedral::lattice::kNumOutputs);
++
++  TYPE_ASSIGN_CHECK(*out_attrs, permutohedral::lattice::kBarycentric,
++                    in_attrs->at(permutohedral::lattice::kFeatures));
++  out_attrs->at(permutohedral::lattice::kOffset) =
++      mshadow::DataType<int32_t>::kFlag;
++  out_attrs->at(permutohedral::lattice::kRank) =
++      mshadow::DataType<int32_t>::kFlag;
++  out_attrs->at(permutohedral::lattice::kBlurNeighbors) =
++      mshadow::DataType<int32_t>::kFlag;
++
++  return out_attrs->at(permutohedral::lattice::kBarycentric) != -1;
++}
++
++// Infers underlying data type for the involved tensors.
++inline bool PermutohedralSplatType(const nnvm::NodeAttrs& attrs,
++                                   std::vector<int>* in_attrs,
++                                   std::vector<int>* out_attrs) {
++  CHECK_EQ(in_attrs->size(), permutohedral::splat::kNumInputs);
++  CHECK_EQ(out_attrs->size(), permutohedral::splat::kNumOutputs);
++
++  TYPE_ASSIGN_CHECK(*out_attrs, permutohedral::splat::kDataOut,
++                    in_attrs->at(permutohedral::splat::kDataIn));
++  TYPE_ASSIGN_CHECK(*in_attrs, permutohedral::splat::kBarycentric,
++                    in_attrs->at(permutohedral::splat::kDataIn));
++  in_attrs->at(permutohedral::splat::kOffset) =
++      mshadow::DataType<int32_t>::kFlag;
++
++  return out_attrs->at(permutohedral::splat::kDataOut) != -1;
++}
++
++// Infers underlying data type for the involved tensors.
++inline bool PermutohedralSliceType(const nnvm::NodeAttrs& attrs,
++                                   std::vector<int>* in_attrs,
++                                   std::vector<int>* out_attrs) {
++  CHECK_EQ(in_attrs->size(), permutohedral::slice::kNumInputs);
++  CHECK_EQ(out_attrs->size(), permutohedral::slice::kNumOutputs);
++
++  TYPE_ASSIGN_CHECK(*out_attrs, permutohedral::slice::kDataOut,
++                    in_attrs->at(permutohedral::slice::kDataIn));
++  TYPE_ASSIGN_CHECK(*in_attrs, permutohedral::slice::kBarycentric,
++                    in_attrs->at(permutohedral::slice::kDataIn));
++  in_attrs->at(permutohedral::slice::kOffset) =
++      mshadow::DataType<int32_t>::kFlag;
++
++  return out_attrs->at(permutohedral::slice::kDataOut) != -1;
++}
++
++// Infers underlying data type for the involved tensors.
++inline bool PermutohedralConvolveType(const nnvm::NodeAttrs& attrs,
++                                      std::vector<int>* in_attrs,
++                                      std::vector<int>* out_attrs) {
++  CHECK_EQ(in_attrs->size(), permutohedral::convolve::kNumInputs);
++  CHECK_EQ(out_attrs->size(), permutohedral::convolve::kNumOutputs);
++
++  TYPE_ASSIGN_CHECK(*out_attrs, permutohedral::convolve::kDataOut,
++                    in_attrs->at(permutohedral::convolve::kDataIn));
++  in_attrs->at(permutohedral::convolve::kBlurNeighbors) =
++      mshadow::DataType<int32_t>::kFlag;
++  TYPE_ASSIGN_CHECK(*in_attrs, permutohedral::convolve::kWeight,
++                    in_attrs->at(permutohedral::convolve::kDataIn));
++
++  return out_attrs->at(permutohedral::convolve::kDataOut) != -1;
++}
++
++// Computes forward pass of permutohedral lattice creation.
++template <typename xpu>
++void PermutohedralLatticeForward(const nnvm::NodeAttrs& attrs,
++                                 const OpContext& ctx,
++                                 const std::vector<TBlob>& inputs,
++                                 const std::vector<OpReqType>& req,
++                                 const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::lattice::kNumInputs);
++  CHECK_EQ(outputs.size(), permutohedral::lattice::kNumOutputs);
++  CHECK_EQ(req.size(), permutohedral::lattice::kNumOutputs);
++  for (std::size_t i = 0; i < permutohedral::lattice::kNumOutputs; ++i) {
++    CHECK_EQ(req[i], kWriteTo);
++  }
++
++  const PermutohedralLatticeParam& parameter =
++      nnvm::get<PermutohedralLatticeParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      outputs[permutohedral::lattice::kBarycentric].type_flag_, DType, {
++        const Tensor<xpu, 3, DType> features =
++            inputs[permutohedral::lattice::kFeatures].get<xpu, 3, DType>(s);
++
++        // Lattice specification.
++        Tensor<xpu, 3, int32_t> rank =
++            outputs[permutohedral::lattice::kRank].get<xpu, 3, int32_t>(s);
++        Tensor<xpu, 3, DType> barycentric =
++            outputs[permutohedral::lattice::kBarycentric].get<xpu, 3, DType>(s);
++        Tensor<xpu, 3, int32_t> offset =
++            outputs[permutohedral::lattice::kOffset].get<xpu, 3, int32_t>(s);
++        // TODO(mkiefel): This is to work around the empty tensor issue. Remove
++        // this improper handling once the issue is solved.
++        Tensor<xpu, 3, int32_t> blur_neighbors_container =
++            outputs[permutohedral::lattice::kBlurNeighbors]
++                .get<xpu, 3, int32_t>(s);
++        const int neighbors =
++            get_filter_size(parameter.neighborhood_size, features.shape_[2]) -
++            1;
++        Shape<3> blur_neighbors_shape =
++            Shape3(features.shape_[0], parameter.lattice_size, neighbors);
++        const Tensor<xpu, 3, int32_t> blur_neighbors(
++            blur_neighbors_container.dptr_, blur_neighbors_shape);
++
++        for (index_t n = 0; n < features.shape_[0]; ++n) {
++          build_lattice(features[n], parameter.neighborhood_size, rank[n],
++                        barycentric[n], offset[n], blur_neighbors[n]);
++        }
++      });
++}
++
++// Computes forward pass of permutohedral splatting.
++template <typename xpu>
++void PermutohedralSplatForward(const nnvm::NodeAttrs& attrs,
++                               const OpContext& ctx,
++                               const std::vector<TBlob>& inputs,
++                               const std::vector<OpReqType>& req,
++                               const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::splat::kNumInputs);
++  CHECK_EQ(outputs.size(), permutohedral::splat::kNumOutputs);
++  CHECK_EQ(req.size(), permutohedral::splat::kNumOutputs);
++  for (std::size_t i = 0; i < permutohedral::splat::kNumOutputs; ++i) {
++    CHECK_EQ(req[i], kWriteTo);
++  }
++
++  const PermutohedralSplatParam& parameter =
++      nnvm::get<PermutohedralSplatParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      outputs[permutohedral::splat::kDataOut].type_flag_, DType, {
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::splat::kDataIn].get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> barycentric =
++            inputs[permutohedral::splat::kBarycentric].get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, int32_t> offset =
++            inputs[permutohedral::splat::kOffset].get<xpu, 3, int32_t>(s);
++
++        Tensor<xpu, 3, DType> data_out =
++            outputs[permutohedral::splat::kDataOut].get<xpu, 3, DType>(s);
++
++        for (index_t n = 0; n < data_in.shape_[0]; ++n) {
++          splat(data_in[n], parameter.features_in_offset, barycentric[n],
++                offset[n], data_out[n]);
++        }
++      });
++}
++//
++// Computes forward pass of permutohedral slicing.
++template <typename xpu>
++void PermutohedralSliceForward(const nnvm::NodeAttrs& attrs,
++                               const OpContext& ctx,
++                               const std::vector<TBlob>& inputs,
++                               const std::vector<OpReqType>& req,
++                               const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::slice::kNumInputs);
++  CHECK_EQ(outputs.size(), permutohedral::slice::kNumOutputs);
++  CHECK_EQ(req.size(), permutohedral::slice::kNumOutputs);
++  for (std::size_t i = 0; i < permutohedral::slice::kNumOutputs; ++i) {
++    CHECK_EQ(req[i], kWriteTo);
++  }
++
++  const PermutohedralSliceParam& parameter =
++      nnvm::get<PermutohedralSliceParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      outputs[permutohedral::slice::kDataOut].type_flag_, DType, {
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::slice::kDataIn].get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> barycentric =
++            inputs[permutohedral::slice::kBarycentric].get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, int32_t> offset =
++            inputs[permutohedral::slice::kOffset].get<xpu, 3, int32_t>(s);
++
++        Tensor<xpu, 3, DType> data_out =
++            outputs[permutohedral::slice::kDataOut].get<xpu, 3, DType>(s);
++
++        for (index_t n = 0; n < data_in.shape_[0]; ++n) {
++          slice(data_in[n], parameter.features_out_offset, barycentric[n],
++                offset[n], data_out[n]);
++        }
++      });
++}
++
++// Computes forward pass of permutohedral convolution.
++template <typename xpu>
++void PermutohedralConvolveForward(const nnvm::NodeAttrs& attrs,
++                                  const OpContext& ctx,
++                                  const std::vector<TBlob>& inputs,
++                                  const std::vector<OpReqType>& req,
++                                  const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::convolve::kNumInputs);
++  CHECK_EQ(outputs.size(), permutohedral::convolve::kNumOutputs);
++  CHECK_EQ(req.size(), permutohedral::convolve::kNumOutputs);
++  for (std::size_t i = 0; i < permutohedral::convolve::kNumOutputs; ++i) {
++    CHECK_EQ(req[i], kWriteTo);
++  }
++
++  const PermutohedralConvolveParam& parameter =
++      nnvm::get<PermutohedralConvolveParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      outputs[permutohedral::convolve::kDataOut].type_flag_, DType, {
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::convolve::kDataIn].get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> weight =
++            inputs[permutohedral::convolve::kWeight].get<xpu, 3, DType>(s);
++
++        // TODO(mkiefel): This is to work around the empty tensor issue. Remove
++        // this improper handling once the issue is solved.
++        Tensor<xpu, 3, int32_t> blur_neighbors_container =
++            inputs[permutohedral::convolve::kBlurNeighbors]
++                .get<xpu, 3, int32_t>(s);
++        int neighbors = blur_neighbors_container.shape_[2];
++        // Revert fix to avoid empty tensor in blur_neighbors.
++        if (neighbors == 1) {
++          --neighbors;
++        }
++        Shape<3> blur_neighbors_shape =
++            Shape3(blur_neighbors_container.shape_[0],
++                   blur_neighbors_container.shape_[1], neighbors);
++        const Tensor<xpu, 3, int32_t> blur_neighbors(
++            blur_neighbors_container.dptr_, blur_neighbors_shape);
++
++        Tensor<xpu, 3, DType> data_out =
++            outputs[permutohedral::convolve::kDataOut].get<xpu, 3, DType>(s);
++
++        // Intermediate results.
++        // TODO(mkiefel): Move initialization of tensors down into compute.
++        Shape<2> lattice_col_data_shape =
++            Shape2(weight.shape_[2], blur_neighbors.shape_[1]);
++        mshadow::Tensor<xpu, 1, DType> workspace =
++            ctx.requested[0].get_space_typed<xpu, 1, DType>(
++                mshadow::Shape1(lattice_col_data_shape.Size()), s);
++        Tensor<xpu, 2, DType> lattice_col_data(workspace.dptr_,
++                                               lattice_col_data_shape, s);
++
++        for (index_t n = 0; n < data_in.shape_[0]; ++n) {
++          blur(data_in[n], weight, blur_neighbors[n], lattice_col_data,
++               data_out[n], s);
++        }
++      });
++}
++
++// Computes backward pass of permutohedral creation.
++template <typename xpu>
++void PermutohedralLatticeBackward(const nnvm::NodeAttrs& attrs,
++                                  const OpContext& ctx,
++                                  const std::vector<TBlob>& inputs,
++                                  const std::vector<OpReqType>& req,
++                                  const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::lattice::kNumOutputs +
++                              permutohedral::lattice::kNumInputs +
++                              permutohedral::lattice::kNumOutputs);
++  CHECK_EQ(outputs.size(), permutohedral::lattice::kNumInputs);
++  CHECK_EQ(req.size(), permutohedral::lattice::kNumInputs);
++  for (std::size_t i = 0; i < permutohedral::lattice::kNumInputs; ++i) {
++    CHECK_NE(req[i], kWriteInplace);
++  }
++
++  const PermutohedralLatticeParam& parameter =
++      nnvm::get<PermutohedralLatticeParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      inputs[permutohedral::lattice::kFeatures].type_flag_, DType, {
++        Tensor<xpu, 3, DType> gradient_features =
++            outputs[permutohedral::lattice::kFeatures].get<xpu, 3, DType>(s);
++
++        const Tensor<xpu, 3, DType> gradient_barycentric =
++            inputs[permutohedral::lattice::kBarycentric].get<xpu, 3, DType>(s);
++
++        // Forward outputs.
++        const Tensor<xpu, 3, int32_t> rank =
++            inputs[permutohedral::lattice::kNumOutputs +
++                   permutohedral::lattice::kNumInputs +
++                   permutohedral::lattice::kRank]
++                .get<xpu, 3, int32_t>(s);
++
++        if (req[permutohedral::lattice::kFeatures] != kNullOp) {
++          if (req[permutohedral::lattice::kFeatures] == kWriteTo) {
++            gradient_features = scalar<DType>(0.0f);
++          }
++
++          for (index_t n = 0; n < rank.shape_[0]; ++n) {
++            build_lattice_tick<xpu, DType>(rank[n], gradient_barycentric[n],
++                                           gradient_features[n]);
++          }
++        } else if (req[permutohedral::lattice::kFeatures] == kNullOp) {
++          return;
++        } else {
++          LOG(FATAL) << "Have not implemented the data req combinations!";
++        }
++      });
++}
++
++// Computes backward pass of permutohedral convolution.
++template <typename xpu>
++void PermutohedralSplatBackward(const nnvm::NodeAttrs& attrs,
++                                const OpContext& ctx,
++                                const std::vector<TBlob>& inputs,
++                                const std::vector<OpReqType>& req,
++                                const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::splat::kNumOutputs +
++                              permutohedral::splat::kNumInputs +
++                              permutohedral::splat::kNumOutputs);
++  CHECK_EQ(outputs.size(), permutohedral::splat::kNumInputs);
++  CHECK_EQ(req.size(), permutohedral::splat::kNumInputs);
++  for (std::size_t i = 0; i < permutohedral::splat::kNumInputs; ++i) {
++    CHECK_NE(req[i], kWriteInplace);
++  }
++
++  const PermutohedralSplatParam& parameter =
++      nnvm::get<PermutohedralSplatParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      inputs[permutohedral::splat::kDataIn].type_flag_, DType, {
++        Tensor<xpu, 3, DType> gradient_data_in =
++            outputs[permutohedral::splat::kDataIn].get<xpu, 3, DType>(s);
++        Tensor<xpu, 3, DType> gradient_barycentric =
++            outputs[permutohedral::splat::kBarycentric].get<xpu, 3, DType>(s);
++
++        const Tensor<xpu, 3, DType> gradient_splatted =
++            inputs[permutohedral::splat::kDataOut].get<xpu, 3, DType>(s);
++
++        // Forward inputs.
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::splat::kNumOutputs +
++                   permutohedral::splat::kDataIn]
++                .get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> barycentric =
++            inputs[permutohedral::splat::kNumOutputs +
++                   permutohedral::splat::kBarycentric]
++                .get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, int32_t> offset =
++            inputs[permutohedral::splat::kNumOutputs +
++                   permutohedral::splat::kOffset]
++                .get<xpu, 3, int32_t>(s);
++
++        // Forward outputs.
++        const Tensor<xpu, 3, DType> data_out =
++            inputs[permutohedral::splat::kNumOutputs +
++                   permutohedral::splat::kNumInputs +
++                   permutohedral::splat::kDataOut]
++                .get<xpu, 3, DType>(s);
++
++        if (req[permutohedral::splat::kDataIn] != kNullOp &&
++            req[permutohedral::splat::kBarycentric] != kNullOp) {
++          if (req[permutohedral::splat::kDataIn] == kWriteTo) {
++            gradient_data_in = scalar<DType>(0.0f);
++          }
++          if (req[permutohedral::splat::kBarycentric] == kWriteTo) {
++            gradient_barycentric = scalar<DType>(0.0f);
++          }
++
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            splat_tick<xpu, DType>(data_in[n], gradient_splatted[n],
++                                   parameter.features_in_offset, barycentric[n],
++                                   offset[n], gradient_barycentric[n],
++                                   gradient_data_in[n]);
++          }
++        } else if (req[permutohedral::splat::kDataIn] == kNullOp &&
++                   req[permutohedral::splat::kBarycentric] != kNullOp) {
++          if (req[permutohedral::splat::kBarycentric] == kWriteTo) {
++            gradient_barycentric = scalar<DType>(0.0f);
++          }
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            splat_tick_barycentric<xpu, DType>(
++                data_in[n], gradient_splatted[n], parameter.features_in_offset,
++                barycentric[n], offset[n], gradient_barycentric[n]);
++          }
++        } else if (req[permutohedral::splat::kDataIn] != kNullOp &&
++                   req[permutohedral::splat::kBarycentric] == kNullOp) {
++          if (req[permutohedral::splat::kDataIn] == kWriteTo) {
++            gradient_data_in = scalar<DType>(0.0f);
++          }
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            splat_tick_data<xpu, DType>(
++                data_in[n], gradient_splatted[n], parameter.features_in_offset,
++                barycentric[n], offset[n], gradient_data_in[n]);
++          }
++        } else if (req[permutohedral::splat::kDataIn] == kNullOp &&
++                   req[permutohedral::splat::kBarycentric] == kNullOp) {
++          return;
++        } else {
++          LOG(FATAL) << "Have not implemented the data req combinations!";
++        }
++      });
++}
++
++// Computes backward pass of permutohedral convolution.
++template <typename xpu>
++void PermutohedralSliceBackward(const nnvm::NodeAttrs& attrs,
++                                const OpContext& ctx,
++                                const std::vector<TBlob>& inputs,
++                                const std::vector<OpReqType>& req,
++                                const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::slice::kNumOutputs +
++                              permutohedral::slice::kNumInputs +
++                              permutohedral::slice::kNumOutputs);
++  CHECK_EQ(outputs.size(), permutohedral::slice::kNumInputs);
++  CHECK_EQ(req.size(), permutohedral::slice::kNumInputs);
++  for (std::size_t i = 0; i < permutohedral::slice::kNumInputs; ++i) {
++    CHECK_NE(req[i], kWriteInplace);
++  }
++
++  const PermutohedralSliceParam& parameter =
++      nnvm::get<PermutohedralSliceParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      inputs[permutohedral::slice::kDataIn].type_flag_, DType, {
++        Tensor<xpu, 3, DType> gradient_data_in =
++            outputs[permutohedral::slice::kDataIn].get<xpu, 3, DType>(s);
++        Tensor<xpu, 3, DType> gradient_barycentric =
++            outputs[permutohedral::slice::kBarycentric].get<xpu, 3, DType>(s);
++
++        const Tensor<xpu, 3, DType> gradient_sliced =
++            inputs[permutohedral::slice::kDataOut].get<xpu, 3, DType>(s);
++
++        // Forward inputs.
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::slice::kNumOutputs +
++                   permutohedral::slice::kDataIn]
++                .get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> barycentric =
++            inputs[permutohedral::slice::kNumOutputs +
++                   permutohedral::slice::kBarycentric]
++                .get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, int32_t> offset =
++            inputs[permutohedral::slice::kNumOutputs +
++                   permutohedral::slice::kOffset]
++                .get<xpu, 3, int32_t>(s);
++
++        // Forward outputs.
++        const Tensor<xpu, 3, DType> data_out =
++            inputs[permutohedral::slice::kNumOutputs +
++                   permutohedral::slice::kNumInputs +
++                   permutohedral::slice::kDataOut]
++                .get<xpu, 3, DType>(s);
++
++        if (req[permutohedral::slice::kDataIn] != kNullOp &&
++            req[permutohedral::slice::kBarycentric] != kNullOp) {
++          if (req[permutohedral::slice::kDataIn] == kWriteTo) {
++            gradient_data_in = scalar<DType>(0.0f);
++          }
++          if (req[permutohedral::slice::kBarycentric] == kWriteTo) {
++            gradient_barycentric = scalar<DType>(0.0f);
++          }
++
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            slice_tick<xpu, DType>(
++                data_in[n], gradient_sliced[n], parameter.features_out_offset,
++                barycentric[n], offset[n], gradient_barycentric[n],
++                gradient_data_in[n]);
++          }
++        } else if (req[permutohedral::splat::kDataIn] == kNullOp &&
++                   req[permutohedral::splat::kBarycentric] != kNullOp) {
++          if (req[permutohedral::splat::kBarycentric] == kWriteTo) {
++            gradient_barycentric = scalar<DType>(0.0f);
++          }
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            slice_tick_barycentric<xpu, DType>(
++                data_in[n], gradient_sliced[n], parameter.features_out_offset,
++                offset[n], gradient_barycentric[n]);
++          }
++        } else if (req[permutohedral::splat::kDataIn] != kNullOp &&
++                   req[permutohedral::splat::kBarycentric] == kNullOp) {
++          if (req[permutohedral::splat::kDataIn] == kWriteTo) {
++            gradient_data_in = scalar<DType>(0.0f);
++          }
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            slice_tick_data<xpu, DType>(
++                gradient_sliced[n], parameter.features_out_offset,
++                barycentric[n], offset[n], gradient_data_in[n]);
++          }
++        } else if (req[permutohedral::slice::kDataIn] == kNullOp &&
++                   req[permutohedral::slice::kBarycentric] == kNullOp) {
++          return;
++        } else {
++          LOG(FATAL) << "Have not implemented the data req combinations!";
++        }
++      });
++}
++
++// Computes backward pass of permutohedral convolution.
++template <typename xpu>
++void PermutohedralConvolveBackward(const nnvm::NodeAttrs& attrs,
++                                   const OpContext& ctx,
++                                   const std::vector<TBlob>& inputs,
++                                   const std::vector<OpReqType>& req,
++                                   const std::vector<TBlob>& outputs) {
++  CHECK_EQ(inputs.size(), permutohedral::convolve::kNumOutputs +
++                              permutohedral::convolve::kNumInputs +
++                              permutohedral::convolve::kNumOutputs);
++  CHECK_EQ(outputs.size(), permutohedral::convolve::kNumInputs);
++  CHECK_EQ(req.size(), permutohedral::convolve::kNumInputs);
++  for (std::size_t i = 0; i < permutohedral::convolve::kNumInputs; ++i) {
++    CHECK_NE(req[i], kWriteInplace);
++  }
++
++  const PermutohedralConvolveParam& parameter =
++      nnvm::get<PermutohedralConvolveParam>(attrs.parsed);
++
++  Stream<xpu>* s = ctx.get_stream<xpu>();
++  MSHADOW_REAL_TYPE_SWITCH(
++      inputs[permutohedral::convolve::kDataIn].type_flag_, DType, {
++        Tensor<xpu, 3, DType> gradient_data_in =
++            outputs[permutohedral::convolve::kDataIn].get<xpu, 3, DType>(s);
++        Tensor<xpu, 3, DType> gradient_weight =
++            outputs[permutohedral::convolve::kWeight].get<xpu, 3, DType>(s);
++
++        const Tensor<xpu, 3, DType> gradient_data_out =
++            inputs[permutohedral::convolve::kDataOut].get<xpu, 3, DType>(s);
++
++        // Forward inputs.
++        const Tensor<xpu, 3, DType> data_in =
++            inputs[permutohedral::convolve::kNumOutputs +
++                   permutohedral::convolve::kDataIn]
++                .get<xpu, 3, DType>(s);
++        const Tensor<xpu, 3, DType> weight =
++            inputs[permutohedral::convolve::kNumOutputs +
++                   permutohedral::convolve::kWeight]
++                .get<xpu, 3, DType>(s);
++
++        // TODO(mkiefel): This is to work around the empty tensor issue. Remove
++        // this improper handling once the issue is solved.
++        Tensor<xpu, 3, int32_t> blur_neighbors_container =
++            inputs[permutohedral::convolve::kNumOutputs +
++                   permutohedral::convolve::kBlurNeighbors]
++                .get<xpu, 3, int32_t>(s);
++        int neighbors = blur_neighbors_container.shape_[2];
++        // Revert fix to avoid empty tensor in blur_neighbors.
++        if (neighbors == 1) {
++          --neighbors;
++        }
++        Shape<3> blur_neighbors_shape =
++            Shape3(blur_neighbors_container.shape_[0],
++                   blur_neighbors_container.shape_[1], neighbors);
++        const Tensor<xpu, 3, int32_t> blur_neighbors(
++            blur_neighbors_container.dptr_, blur_neighbors_shape);
++
++        // Forward outputs.
++        const Tensor<xpu, 3, DType> data_out =
++            inputs[permutohedral::convolve::kNumOutputs +
++                   permutohedral::convolve::kNumInputs +
++                   permutohedral::convolve::kDataOut]
++                .get<xpu, 3, DType>(s);
++
++        // Intermediate results.
++        // TODO(mkiefel): Move initialization of tensors down into compute.
++        Shape<2> lattice_col_data_shape =
++            Shape2(weight.shape_[2], blur_neighbors.shape_[1]);
++        mshadow::Tensor<xpu, 1, DType> workspace =
++            ctx.requested[0].get_space_typed<xpu, 1, DType>(
++                mshadow::Shape1(lattice_col_data_shape.Size()), s);
++        Tensor<xpu, 2, DType> lattice_col_data(workspace.dptr_,
++                                               lattice_col_data_shape, s);
++
++        if (req[permutohedral::convolve::kDataIn] != kNullOp &&
++            req[permutohedral::convolve::kWeight] != kNullOp) {
++          if (req[permutohedral::convolve::kDataIn] == kWriteTo) {
++            gradient_data_in = scalar<DType>(0.0f);
++          }
++          if (req[permutohedral::convolve::kWeight] == kWriteTo) {
++            gradient_weight = scalar<DType>(0.0f);
++          }
++
++          for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++            blur_tick<xpu, DType>(data_in[n], gradient_data_out[n], weight,
++                                  blur_neighbors[n], lattice_col_data,
++                                  gradient_weight, gradient_data_in[n], s);
++          }
++        } else if (req[permutohedral::convolve::kDataIn] != kNullOp &&
++                   req[permutohedral::convolve::kWeight] == kNullOp) {
++           if (req[permutohedral::convolve::kDataIn] == kWriteTo) {
++             gradient_data_in = scalar<DType>(0.0f);
++           }
++           for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++             blur_tick_data<xpu, DType>(data_in[n], gradient_data_out[n],
++                                        weight, blur_neighbors[n],
++                                        lattice_col_data, gradient_data_in[n],
++                                        s);
++           }
++        } else if (req[permutohedral::convolve::kDataIn] == kNullOp &&
++                   req[permutohedral::convolve::kWeight] != kNullOp) {
++           if (req[permutohedral::convolve::kWeight] == kWriteTo) {
++             gradient_weight = scalar<DType>(0.0f);
++           }
++           for (index_t n = 0; n < data_out.shape_[0]; ++n) {
++             blur_tick_weight<xpu, DType>(data_in[n], gradient_data_out[n],
++                                          weight, blur_neighbors[n],
++                                          lattice_col_data, gradient_weight, s);
++           }
++        } else if (req[permutohedral::convolve::kDataIn] == kNullOp &&
++                   req[permutohedral::convolve::kWeight] != kNullOp) {
++          return;
++        } else {
++          LOG(FATAL) << "Have not implemented the data req combinations!";
++        }
++      });
++}
++
++}  // namespace op
++}  // namespace mxnet
++
++#endif  // MXNET_OPERATOR_PERMUTOHEDRAL_INL_H_
+diff --git a/src/operator/permutohedral.cc b/src/operator/permutohedral.cc
+new file mode 100644
+index 0000000..59bd346
+--- /dev/null
++++ b/src/operator/permutohedral.cc
+@@ -0,0 +1,1073 @@
++// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#include "./permutohedral-inl.h"
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <memory>
++#include <unordered_map>
++#include <vector>
++
++#include "./linalg.h"
++
++namespace mxnet {
++namespace op {
++using KeyType = Tensor<cpu, 1, int>;
++using KeyContainerType = TensorContainer<cpu, 1, int>;
++
++// Hashes one-dimensional tensor types. This allows them to be used as a key in
++// hash-map.
++class LatticeVertexHash {
++ public:
++  std::size_t operator()(const Tensor<cpu, 1, int>& key) const {
++    std::size_t seed = 0;
++    for (int i = 0; i < static_cast<int>(key.shape_[0]); ++i) {
++      seed ^= std::hash<int>{}(key[i]) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
++    }
++    return seed;
++  }
++};
++
++// Tests equality of two one-dimensional tensor types. Required for a hash-map
++// to verify element identity.
++class LatticeVertexEquality {
++ public:
++  bool operator()(const Tensor<cpu, 1, int>& lhs,
++                  const Tensor<cpu, 1, int>& rhs) const {
++    if (lhs.shape_[0] != rhs.shape_[0]) {
++      return false;
++    }
++    bool is_equal = true;
++    for (int i = 0; i < static_cast<int>(lhs.shape_[0]) && is_equal; ++i) {
++      is_equal = is_equal && lhs[i] == rhs[i];
++    }
++    return is_equal;
++  }
++};
++
++// Frees the underlying memory of the tensor and the 'tensor' itself.
++template <typename xpu, int dim, typename DType>
++void delete_tensor(Tensor<xpu, dim, DType>* tensor) {
++  FreeSpace(tensor);
++  delete (tensor);
++}
++
++// Creates a new unique_ptr to a self-destructing tensor and initializes with
++// 'value'.
++template <typename xpu, int dim, typename DType>
++std::unique_ptr<Tensor<xpu, dim, DType>,
++                decltype(&delete_tensor<xpu, dim, DType>)>
++make_unique_tensor(Tensor<xpu, dim, DType> value) {
++  auto tensor = std::unique_ptr<Tensor<xpu, dim, DType>,
++                                decltype(&delete_tensor<xpu, dim, DType>)>(
++      new Tensor<xpu, dim, DType>(), &delete_tensor);
++  *tensor = value;
++  return tensor;
++}
++
++inline void advance_in_dimension(const int dimension,
++                                 const int increment,
++                                 KeyType key) {
++  const int features_dim = key.shape_[0] - 1;
++  for (int d = 0; d < features_dim + 1; ++d) {
++    key[d] -= increment;
++  }
++  key[dimension] += increment * (1 + features_dim);
++}
++
++// data           num_filter x (M_+1)                           row-major
++// barycentric    N x feature_dim + 1                           row-major
++// offset         N x feature_dim + 1                           row-major
++// sliced         num_filter x out_size                         row-major
++template <typename xpu, typename DType>
++void slice(const Tensor<xpu, 2, DType>& data,
++           const int out_offset,
++           const Tensor<xpu, 2, DType>& barycentric,
++           const Tensor<xpu, 2, int32_t>& offset,
++           Tensor<xpu, 2, DType> sliced) {
++  sliced = scalar<DType>(0);
++  for (index_t i = 0; i < sliced.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[out_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      const DType& w = barycentric[out_offset + i][j];
++
++      for (index_t k = 0; k < sliced.shape_[0]; k++) {
++        sliced[k][i] += w * data[k][o];
++      }
++    }
++  }
++}
++
++// im             value_size x (M_+1)                               row-major
++// blur_neighbors M_ x (filter_size-1)                              row-major
++// col            value_size * filter_size x (end - start)          row-major
++template <typename xpu, typename DType>
++void im2col(const Tensor<xpu, 2, DType>& im,
++            const index_t start,
++            const Tensor<xpu, 2, int32_t>& blur_neighbors,
++            Tensor<xpu, 2, DType> col) {
++  const index_t output_size = col.shape_[1];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  for (index_t i = 0; i < output_size; ++i) {
++    for (index_t k = 0; k < im.shape_[0]; ++k) {
++      CHECK_LT(k * filter_size + 0, col.shape_[0]);
++      CHECK_LT(i, col.shape_[1]);
++      col[k * filter_size + 0][i] = im[k][i + start + 1];
++
++      for (index_t f = 1; f < filter_size; ++f) {
++        CHECK_GE(blur_neighbors[i + start][f - 1] + 1, 0);
++        CHECK_LT(blur_neighbors[i + start][f - 1] + 1, im.shape_[1]);
++        col[k * filter_size + f][i] =
++            im[k][blur_neighbors[i + start][f - 1] + 1];
++      }
++    }
++  }
++}
++
++// col            value_size * filter_size x (end - start)          row-major
++// blur_neighbors M_ x (filter_size-1)                              row-major
++// im             value_size      x (M_+1)                          row-major
++template <typename xpu, typename DType>
++void col2im(const Tensor<xpu, 2, DType>& col,
++            const std::size_t start,
++            const Tensor<xpu, 2, int32_t>& blur_neighbors,
++            Tensor<xpu, 2, DType> im) {
++  const index_t output_size = col.shape_[1];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  for (index_t i = 0; i < output_size; ++i) {
++    for (index_t k = 0; k < im.shape_[0]; ++k) {
++      im[k][i + start + 1] += col[k * filter_size + 0][i];
++
++      for (index_t f = 1; f < filter_size; ++f) {
++        im[k][blur_neighbors[i + start][f - 1] + 1] +=
++            col[k * filter_size + f][i];
++      }
++    }
++  }
++}
++
++// filter         groups x num_filter / groups
++//                x value_size / groups * filter_size
++//                                                  row-major
++// splatted       value_size x (lattice_size+1)     row-major
++// blur_neighbors lattice_size x (filter_size-1)    row-major
++// blurred        num_filter x (lattice_size+1)     row-major
++// col_data       value_size / groups * filter_size
++//                x lattice_size                    row-major
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape blurred to groups x
++//                num_filter / groups x lattice_size.
++template <typename xpu, typename DType>
++void blur(const Tensor<xpu, 2, DType>& splatted,
++          const Tensor<xpu, 3, DType>& filter,
++          const Tensor<xpu, 2, int32_t>& blur_neighbors,
++          Tensor<xpu, 2, DType> col_data,
++          Tensor<xpu, 2, DType> blurred,
++          Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t N = blurred.shape_[1];
++
++  blurred = scalar<DType>(0);
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(blurred.shape_[0], N - 1);
++  Tensor<xpu, 2, DType> blurred_help(blurred.dptr_ + 1, help_shape, N, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(splatted.Slice(splatted.shape_[0] / groups * g,
++                          splatted.shape_[0] / groups * (g + 1)),
++           0, blur_neighbors, col_data);
++
++    CHECK_LT(g, filter.shape_[0]);
++    CHECK_LT(g * M, blurred.shape_[0]);
++    CHECK_LE((g + 1) * M, blurred.shape_[0]);
++    linalg_gemm<xpu, DType>(filter[g], col_data,
++                            blurred_help.Slice(g * M, (g + 1) * M), 1, 0, false,
++                            false, s);
++  }
++}
++
++// in             value_size x in_size                          row-major
++// barycentric    N x feature_dim + 1                           row-major
++// offset         N x feature_dim + 1                           row-major
++// splatted       value_size x (M_+1)                           row-major
++template <typename xpu, typename DType>
++void splat(const Tensor<xpu, 2, DType>& in,
++           const index_t in_offset,
++           const Tensor<xpu, 2, DType>& barycentric,
++           const Tensor<xpu, 2, int32_t>& offset,
++           Tensor<xpu, 2, DType> splatted) {
++  splatted = scalar<DType>(0);
++  for (index_t i = 0; i < in.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[in_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      CHECK_LT(o, splatted.shape_[1]);
++      const DType& w = barycentric[in_offset + i][j];
++
++      for (index_t k = 0; k < in.shape_[0]; k++) {
++        splatted[k][o] += w * in[k][i];
++      }
++    }
++  }
++}
++
++template <typename xpu, typename DType>
++void compute(const Tensor<xpu, 2, DType>& in,
++             const index_t in_offset,
++             const index_t out_offset,
++             const Tensor<xpu, 3, DType>& filter,
++             const Tensor<xpu, 2, DType>& barycentric,
++             const Tensor<xpu, 2, int32_t>& offset,
++             const Tensor<xpu, 2, int32_t>& blur_neighbors,
++             Tensor<xpu, 2, DType> splatted,
++             Tensor<xpu, 2, DType> blurred,
++             Tensor<xpu, 2, DType> col_data,
++             Tensor<xpu, 2, DType> out,
++             Stream<xpu>* s) {
++  splat(in, in_offset, barycentric, offset, splatted);
++  blur(splatted, filter, blur_neighbors, col_data, blurred, s);
++  slice(blurred, out_offset, barycentric, offset, out);
++}
++
++// gradient_data       num_filter x (M_+1)                           row-major
++// barycentric         N x feature_dim + 1                           row-major
++// offset              N x feature_dim + 1                           row-major
++// gradient_barycentric N x feature_dim + 1                          row-major
++// gradient_sliced     num_filter x out_size                         row-major
++// data and gradient_data are allowed to be the same tensor.
++template <typename xpu, typename DType>
++void slice_tick(const Tensor<xpu, 2, DType>& data,
++                const Tensor<xpu, 2, DType>& gradient_sliced,
++                const int out_offset,
++                const Tensor<xpu, 2, DType>& barycentric,
++                const Tensor<xpu, 2, int32_t>& offset,
++                Tensor<xpu, 2, DType> gradient_barycentric,
++                Tensor<xpu, 2, DType> gradient_data) {
++  // TODO(mkiefel): Fuse loops to avoid additional computation.
++  // First we compute the gradient w.r.t. the barycentric coordinates...
++  slice_tick_barycentric(data, gradient_sliced, out_offset, offset,
++                         gradient_barycentric);
++  // and then we compute the gradient w.r.t. the blurred data to allow data and
++  // gradient_data to be the same tensor.
++  gradient_data = scalar<DType>(0);
++  slice_tick_data(gradient_sliced, out_offset, barycentric, offset,
++                  gradient_data);
++}
++
++// offset              N x feature_dim + 1                           row-major
++// gradient_barycentric N x feature_dim + 1                          row-major
++// gradient_sliced     num_filter x out_size                         row-major
++template <typename xpu, typename DType>
++void slice_tick_barycentric(const Tensor<xpu, 2, DType>& data,
++                            const Tensor<xpu, 2, DType>& gradient_sliced,
++                            const int out_offset,
++                            const Tensor<xpu, 2, int32_t>& offset,
++                            Tensor<xpu, 2, DType> gradient_barycentric) {
++  for (index_t i = 0; i < gradient_sliced.shape_[1]; i++) {
++    for (index_t j = 0; j < gradient_barycentric.shape_[1]; j++) {
++      int o = offset[out_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      DType& gradient_w = gradient_barycentric[out_offset + i][j];
++
++      for (index_t k = 0; k < gradient_sliced.shape_[0]; k++) {
++        gradient_w += data[k][o] * gradient_sliced[k][i];
++      }
++    }
++  }
++}
++
++// gradient_data       num_filter x (M_+1)                           row-major
++// barycentric         N x feature_dim + 1                           row-major
++// offset              N x feature_dim + 1                           row-major
++// gradient_sliced     num_filter x out_size                         row-major
++// data and gradient_data are allowed to be the same tensor.
++template <typename xpu, typename DType>
++void slice_tick_data(const Tensor<xpu, 2, DType>& gradient_sliced,
++                     const int out_offset,
++                     const Tensor<xpu, 2, DType>& barycentric,
++                     const Tensor<xpu, 2, int32_t>& offset,
++                     Tensor<xpu, 2, DType> gradient_data) {
++  for (index_t i = 0; i < gradient_sliced.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[out_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      const DType& w = barycentric[out_offset + i][j];
++
++      for (index_t k = 0; k < gradient_sliced.shape_[0]; k++) {
++        gradient_data[k][o] += w * gradient_sliced[k][i];
++      }
++    }
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size
++//                                                     row-major
++// gradient_splatted value_size x (lattice_size+1)     row-major
++// blur_neighbors    lattice_size x (filter_size-1)    row-major
++// gradient_blurred  num_filter x (lattice_size+1)     row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                    row-major
++// splatted and gradient_splatted can be the same tensor.
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x (lattice_size+1).
++template <typename xpu, typename DType>
++void blur_tick(const Tensor<xpu, 2, DType>& splatted,
++               const Tensor<xpu, 2, DType>& gradient_blurred,
++               const Tensor<xpu, 3, DType>& filter,
++               const Tensor<xpu, 2, int32_t>& blur_neighbors,
++               Tensor<xpu, 2, DType> col_data,
++               Tensor<xpu, 3, DType> gradient_filter,
++               Tensor<xpu, 2, DType> gradient_splatted,
++               Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t N = gradient_blurred.shape_[1];
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], N - 1);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, N, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(splatted.Slice(splatted.shape_[0] / groups * g,
++                          splatted.shape_[0] / groups * (g + 1)),
++           0, blur_neighbors, col_data);
++
++    // Gradient w.r.t. filter.
++    linalg_gemm<xpu, DType>(gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, gradient_filter[g], 1, 1, false, true, s);
++    // Gradient w.r.t. data.
++    linalg_gemm<xpu, DType>(filter[g],
++                            gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, 1, 0, true, false, s);
++
++    gradient_splatted.Slice(gradient_splatted.shape_[0] / groups * g,
++                            gradient_splatted.shape_[0] / groups * (g + 1)) =
++        scalar<DType>(0);
++    col2im(col_data, 0, blur_neighbors,
++           gradient_splatted.Slice(
++               gradient_splatted.shape_[0] / groups * g,
++               gradient_splatted.shape_[0] / groups * (g + 1)));
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size
++//                                                     row-major
++// blur_neighbors    lattice_size x (filter_size-1)    row-major
++// gradient_blurred  num_filter x (lattice_size+1)     row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                    row-major
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x (lattice_size+1).
++template <typename xpu, typename DType>
++void blur_tick_weight(const Tensor<xpu, 2, DType>& splatted,
++                      const Tensor<xpu, 2, DType>& gradient_blurred,
++                      const Tensor<xpu, 3, DType>& filter,
++                      const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                      Tensor<xpu, 2, DType> col_data,
++                      Tensor<xpu, 3, DType> gradient_filter,
++                      Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t N = gradient_blurred.shape_[1];
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], N - 1);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, N, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(splatted.Slice(splatted.shape_[0] / groups * g,
++                          splatted.shape_[0] / groups * (g + 1)),
++           0, blur_neighbors, col_data);
++
++    // Gradient w.r.t. filter.
++    linalg_gemm<xpu, DType>(gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, gradient_filter[g], 1, 1, false, true, s);
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size
++//                                                     row-major
++// gradient_splatted value_size x (lattice_size+1)     row-major
++// blur_neighbors    lattice_size x (filter_size-1)    row-major
++// gradient_blurred  num_filter x (lattice_size+1)     row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                    row-major
++// splatted and gradient_splatted can be the same tensor.
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x (lattice_size+1).
++template <typename xpu, typename DType>
++void blur_tick_data(const Tensor<xpu, 2, DType>& splatted,
++                    const Tensor<xpu, 2, DType>& gradient_blurred,
++                    const Tensor<xpu, 3, DType>& filter,
++                    const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                    Tensor<xpu, 2, DType> col_data,
++                    Tensor<xpu, 2, DType> gradient_splatted,
++                    Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t N = gradient_blurred.shape_[1];
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], N - 1);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, N, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(splatted.Slice(splatted.shape_[0] / groups * g,
++                          splatted.shape_[0] / groups * (g + 1)),
++           0, blur_neighbors, col_data);
++
++    // Gradient w.r.t. data.
++    linalg_gemm<xpu, DType>(filter[g],
++                            gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, 1, 0, true, false, s);
++
++    gradient_splatted.Slice(gradient_splatted.shape_[0] / groups * g,
++                            gradient_splatted.shape_[0] / groups * (g + 1)) =
++        scalar<DType>(0);
++    col2im(col_data, 0, blur_neighbors,
++           gradient_splatted.Slice(
++               gradient_splatted.shape_[0] / groups * g,
++               gradient_splatted.shape_[0] / groups * (g + 1)));
++  }
++}
++
++
++// in             value_size x in_size                          row-major
++// barycentric    N x feature_dim + 1                           row-major
++// offset         N x feature_dim + 1                           row-major
++// splatted       value_size x (M_+1)                           row-major
++template <typename xpu, typename DType>
++void splat_tick(const Tensor<xpu, 2, DType>& in,
++                const Tensor<xpu, 2, DType>& gradient_splatted,
++                const index_t in_offset,
++                const Tensor<xpu, 2, DType>& barycentric,
++                const Tensor<xpu, 2, int32_t>& offset,
++                Tensor<xpu, 2, DType> gradient_barycentric,
++                Tensor<xpu, 2, DType> gradient_in) {
++  for (index_t i = 0; i < gradient_in.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[in_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      const DType& w = barycentric[in_offset + i][j];
++      DType& gradient_w = gradient_barycentric[in_offset + i][j];
++      for (index_t k = 0; k < gradient_in.shape_[0]; k++) {
++        gradient_in[k][i] += w * gradient_splatted[k][o];
++        gradient_w += in[k][i] * gradient_splatted[k][o];
++      }
++    }
++  }
++}
++
++// in             value_size x in_size                          row-major
++// barycentric    N x feature_dim + 1                           row-major
++// offset         N x feature_dim + 1                           row-major
++// splatted       value_size x (M_+1)                           row-major
++template <typename xpu, typename DType>
++void splat_tick_barycentric(const Tensor<xpu, 2, DType>& in,
++                            const Tensor<xpu, 2, DType>& gradient_splatted,
++                            const index_t in_offset,
++                            const Tensor<xpu, 2, DType>& barycentric,
++                            const Tensor<xpu, 2, int32_t>& offset,
++                            Tensor<xpu, 2, DType> gradient_barycentric) {
++  for (index_t i = 0; i < in.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[in_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      const DType& w = barycentric[in_offset + i][j];
++      DType& gradient_w = gradient_barycentric[in_offset + i][j];
++      for (index_t k = 0; k < in.shape_[0]; k++) {
++        gradient_w += in[k][i] * gradient_splatted[k][o];
++      }
++    }
++  }
++}
++
++// in             value_size x in_size                          row-major
++// barycentric    N x feature_dim + 1                           row-major
++// offset         N x feature_dim + 1                           row-major
++// splatted       value_size x (M_+1)                           row-major
++template <typename xpu, typename DType>
++void splat_tick_data(const Tensor<xpu, 2, DType>& in,
++                     const Tensor<xpu, 2, DType>& gradient_splatted,
++                     const index_t in_offset,
++                     const Tensor<xpu, 2, DType>& barycentric,
++                     const Tensor<xpu, 2, int32_t>& offset,
++                     Tensor<xpu, 2, DType> gradient_in) {
++  for (index_t i = 0; i < gradient_in.shape_[1]; i++) {
++    for (index_t j = 0; j < barycentric.shape_[1]; j++) {
++      int o = offset[in_offset + i][j] + 1;
++      CHECK_GE(o, 0);
++      const DType& w = barycentric[in_offset + i][j];
++      for (index_t k = 0; k < gradient_in.shape_[0]; k++) {
++        gradient_in[k][i] += w * gradient_splatted[k][o];
++      }
++    }
++  }
++}
++
++// TODO(mkiefel): Check if there is a way to avoid the additional call to
++//                splat?
++template <typename xpu, typename DType>
++void compute_tick(const Tensor<xpu, 2, DType>& in,
++                  const index_t in_offset,
++                  const index_t out_offset,
++                  const Tensor<xpu, 3, DType>& filter,
++                  const Tensor<xpu, 2, DType>& barycentric,
++                  const Tensor<xpu, 2, int32_t>& offset,
++                  const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                  const Tensor<xpu, 2, DType>& gradient_out,
++                  Tensor<xpu, 2, DType> gradient_barycentric,
++                  Tensor<xpu, 2, DType> gradient_splatted,
++                  Tensor<xpu, 2, DType> gradient_blurred,
++                  Tensor<xpu, 2, DType> col_data,
++                  Tensor<xpu, 3, DType> gradient_filter,
++                  Tensor<xpu, 2, DType> gradient_in,
++                  Stream<xpu>* s) {
++  Tensor<xpu, 2, DType>& splatted = gradient_splatted;
++  splat(in, in_offset, barycentric, offset, splatted);
++  Tensor<xpu, 2, DType>& blurred = gradient_blurred;
++  blur(splatted, filter, blur_neighbors, col_data, blurred, s);
++  slice_tick(blurred, gradient_out, out_offset, barycentric, offset,
++             gradient_barycentric, gradient_blurred);
++  blur_tick(splatted, gradient_blurred, filter, blur_neighbors, col_data,
++            gradient_filter, gradient_splatted, s);
++  splat_tick(in, gradient_splatted, in_offset, barycentric, offset,
++             gradient_barycentric, gradient_in);
++}
++
++template <typename xpu>
++class NeighborhoodCallback {
++ public:
++  NeighborhoodCallback(Tensor<xpu, 1, int32_t> neighbors, int* n)
++      : neighbors_(neighbors), n_(*n) {}
++
++  void operator()(const int indx) {
++    if (n_ >= 0)
++      neighbors_[n_] = indx;
++    ++n_;
++  }
++
++ private:
++  Tensor<xpu, 1, int32_t> neighbors_;
++  int& n_;
++};
++
++class LatticeApproximateTraversal {
++ public:
++  LatticeApproximateTraversal(const int neighborhood_size,
++                              const int features_dim,
++                              const Tensor<cpu, 2, int>& immediate_neighbors)
++      : neighborhood_size_(neighborhood_size),
++        features_dim_(features_dim),
++        immediate_neighbors_(immediate_neighbors) {}
++
++  LatticeApproximateTraversal(const LatticeApproximateTraversal&) = delete;
++  LatticeApproximateTraversal& operator=(const LatticeApproximateTraversal&) =
++      delete;
++
++  template <typename TFun>
++  void go(const int start, TFun yield) const {
++    walk_approximate(start, 0, false, yield);
++  }
++
++ private:
++  template <typename TFun>
++  void walk_approximate(const int start,
++                        const int d,
++                        const bool has_zero,
++                        TFun yield) const {
++    if (d <= features_dim_) {
++      int walking = start;
++
++      const int range_end =
++          (d < features_dim_ || has_zero) ? neighborhood_size_ + 1 : 1;
++      for (int i = 0; i < range_end; ++i) {
++        walk_approximate(walking, d + 1, has_zero || i == 0, yield);
++        if (walking >= 0)
++          walking = immediate_neighbors_[d][walking];
++      }
++    } else {
++      yield(start);
++    }
++  }
++
++  const int neighborhood_size_;
++  const int features_dim_;
++  const Tensor<cpu, 2, int>& immediate_neighbors_;
++};
++
++// Lifts 'features' into the d+1 dimensional space that contains the
++// permutohedral hyper-plane.
++template <typename DType>
++Tensor<cpu, 1, DType> elevate(const Tensor<cpu, 1, DType>& features) {
++  // Implements elevation from page 5 from Adams at al. "Fast High-Dimensional
++  // Filtering Using the Permutohedral Lattice"
++  const int features_dim = features.shape_[0];
++  const DType inv_std_deviation = std::sqrt(2.0 / 3.0) * (features_dim + 1);
++
++  // Add small constant value to features in order to avoid points lying on
++  // the lattice grid since this would result in undefined gradients in the
++  // backward path.
++  const DType features_offset = 0.001;
++
++  Tensor<cpu, 1, DType> elevated =
++      NewTensor<cpu>(Shape1(features_dim + 1), static_cast<DType>(0));
++  DType sum = 0;
++  for (int d = features_dim; d > 0; --d) {
++    // Scale according to the diagonal of the elevation matrix.
++    const DType scaled_coordinate = (features_offset + features[d - 1]) /
++                                    std::sqrt(static_cast<DType>(d * (d + 1))) *
++                                    inv_std_deviation;
++    // Sum according to the summing matrix of the elevation matrix.
++    elevated[d] = -(d * scaled_coordinate) + sum;
++    sum += scaled_coordinate;
++  }
++  elevated[0] = sum;
++
++  return elevated;
++}
++
++// Finds closest remainder-0 point on permutohedral plane. Returns both the key
++// to the lattice point and the order to sort the coordinate of 'elevated'.
++template <typename DType>
++void find_closest_zero(const Tensor<cpu, 1, DType>& elevated,
++                       KeyType closest,
++                       Tensor<cpu, 1, int32_t> rank) {
++  // Closely follow Algorithm 3 on page 447 of Conway and Sloane "Sphere
++  // Packing, Lattices and Groups".
++  const int features_dim = elevated.shape_[0] - 1;
++  TensorContainer<cpu, 1, DType> delta(Shape1(features_dim + 1), 0);
++
++  // Step 2: Compute the closest point in Z_{d+1}.
++  DType sum = 0;
++  for (int i = 0; i < features_dim + 1; ++i) {
++    const DType unscaled_lattice_coordinate =
++        std::round(elevated[i] / (features_dim + 1));
++    sum += unscaled_lattice_coordinate;
++    closest[i] = unscaled_lattice_coordinate * (features_dim + 1);
++    delta[i] = elevated[i] - closest[i];
++  }
++
++  // Step 3: Sort in order of increasing value.
++  std::vector<int> order(features_dim + 1);
++  for (int i = 0; i < static_cast<int>(order.size()); ++i) {
++    order[i] = i;
++  }
++  std::sort(order.begin(), order.end(),
++            [&delta](const int& lhs, const int& rhs) {
++              return delta[lhs] > delta[rhs];
++            });
++  for (int i = 0; i < features_dim + 1; ++i) {
++    rank[order[i]] = i;
++  }
++
++  // Step 4: Project back to closest point on A_{d}.
++  for (int i = 0; i < features_dim + 1; ++i) {
++    // Circular shift every rank by sum. sum-many coordinates will be corrected
++    // and this changes the location of every coordinate by sum.
++    rank[i] += sum;
++    if (rank[i] > features_dim) {
++      // This coordinate is among the smallest sum-many coordinates; first case
++      // of Step 4.
++      closest[i] -= features_dim + 1;
++      // Correct rank by wrapping around similar to a modulus.
++      rank[i] -= features_dim + 1;
++    } else if (rank[i] < 0) {
++      // This coordinate is among the smallest sum-many coordinates; second case
++      // of Step 4.
++      closest[i] += features_dim + 1;
++      // Correct rank by wrapping around similar to a modulus.
++      rank[i] += features_dim + 1;
++    }
++  }
++}
++
++// Builds the reference simplex of the permutohedral lattice in 'features_dim'+1
++// dimensions.
++Tensor<cpu, 2, int> build_canonical_simplex(const int features_dim) {
++  Tensor<cpu, 2, int> canonical_simplex =
++      NewTensor<cpu>(Shape2(features_dim + 1, features_dim + 1), 0);
++
++  for (int i = 0; i < features_dim + 1; ++i) {
++    Tensor<cpu, 1, int> point = canonical_simplex[i];
++    for (int j = 0; j < features_dim + 1 - i; ++j) {
++      point[j] = i;
++    }
++    for (int j = features_dim + 1 - i; j < features_dim + 1; ++j) {
++      point[j] = i - (features_dim + 1);
++    }
++  }
++  return canonical_simplex;
++}
++
++// Constructs a lattice based on the given 'features'.
++template <typename xpu, typename DType>
++void build_lattice(const Tensor<xpu, 2, DType>& features,
++                   int neighborhood_size,
++                   Tensor<xpu, 2, int32_t> rank,
++                   Tensor<xpu, 2, DType> barycentric,
++                   Tensor<xpu, 2, int32_t> offset,
++                   Tensor<xpu, 2, int32_t> blur_neighbors) {
++  const int features_size = features.shape_[0];
++  const int features_dim = features.shape_[1];
++
++  const auto canonical_simplex =
++      make_unique_tensor<xpu, 2, int>(build_canonical_simplex(features_dim));
++
++  std::unordered_map<KeyType, int, LatticeVertexHash, LatticeVertexEquality>
++      key_lookup;
++
++  offset = -1;
++  barycentric = 0;
++
++  TensorContainer<cpu, 1, DType> local_barycentric(Shape1(features_dim + 2), 0);
++  KeyContainerType zero(Shape1(features_dim + 1), 0);
++  for (int i = 0; i < features_size; ++i) {
++    // Lift each feature point into the higher dimensional lattice space.
++    const auto elevated =
++        make_unique_tensor<cpu, 1, DType>(elevate(features[i]));
++    find_closest_zero(*elevated, zero, rank[i]);
++
++    local_barycentric = 0;
++    for (int j = 0; j < features_dim + 1; ++j) {
++      const DType update = ((*elevated)[j] - zero[j]) / (features_dim + 1);
++      local_barycentric[features_dim - rank[i][j]] += update;
++      local_barycentric[features_dim + 1 - rank[i][j]] -= update;
++    }
++    local_barycentric[0] += 1.0 + local_barycentric[features_dim + 1];
++
++    // Find lattice cell (it's defined by the zero-remainder point and rank, the
++    // order of the coordinates).
++    Tensor<xpu, 1, int32_t> feature_offset = offset[i];
++    Tensor<xpu, 1, DType> feature_barycentric = barycentric[i];
++    for (int j = 0; j < features_dim + 1; ++j) {
++      // Insert into hash.
++      KeyType key = NewTensor<cpu>(Shape1(features_dim + 1), 0);
++      for (int k = 0; k < features_dim + 1; k++) {
++        key[k] = zero[k] + (*canonical_simplex)[j][rank[i][k]];
++      }
++
++      const auto insert_result =
++          key_lookup.insert(std::make_pair(key, key_lookup.size()));
++      if (!insert_result.second) {
++        FreeSpace(&key);
++      }
++      feature_offset[j] = insert_result.first->second;
++      feature_barycentric[j] = local_barycentric[j];
++    }
++  }
++
++  // Find the Neighbors of each lattice point
++  // Get the number of vertices in the lattice
++  const int lattice_size = key_lookup.size();
++
++  // Create the neighborhood structure
++  // blur_neighbors M_ x (filter_size-1)                              row-major
++  const int filter_size = get_filter_size(neighborhood_size, features_dim);
++  CHECK_GE(blur_neighbors.shape_[0], lattice_size);
++  CHECK_EQ(blur_neighbors.shape_[1], filter_size - 1);
++  blur_neighbors = scalar<int32_t>(-1);
++
++  KeyContainerType walking_key(Shape1(features_dim + 1), 0);
++
++  TensorContainer<cpu, 2, int> immediate_neighbors(
++      Shape2(features_dim + 1, lattice_size), -1);
++  for (const auto& vertex : key_lookup) {
++    const KeyType& key = vertex.first;
++    for (int d = 0; d < features_dim + 1; ++d) {
++      walking_key = 1 * key;
++      advance_in_dimension(d, 1, walking_key);
++
++      int index = -1;
++      const auto found = key_lookup.find(walking_key);
++      if (found != key_lookup.end()) {
++        index = found->second;
++      }
++      immediate_neighbors[d][vertex.second] = index;
++    }
++  }
++
++  // Free the lookup.
++  for (auto it = key_lookup.begin(); it != key_lookup.end(); /* empty */) {
++    KeyType key = it->first;
++    it = key_lookup.erase(it);
++    FreeSpace(&key);
++  }
++
++  // Lattice traversal using immediate neighbour indices.
++  LatticeApproximateTraversal traverse(neighborhood_size, features_dim,
++                                       immediate_neighbors);
++  for (int i = 0; i < lattice_size; ++i) {
++    int n = -1;
++    NeighborhoodCallback<xpu> yield(blur_neighbors[i], &n);
++    traverse.go(i, yield);
++    CHECK_EQ(n + 1, filter_size);
++  }
++}
++
++template <typename xpu, typename DType>
++void build_lattice_tick(const Tensor<xpu, 2, int32_t>& rank,
++                        const Tensor<xpu, 2, DType>& gradient_barycentric,
++                        Tensor<xpu, 2, DType> gradient_features) {
++  const int N = gradient_features.shape_[0];
++  const int d = gradient_features.shape_[1];
++
++  std::vector<float> scale_factor(d);
++  std::vector<DType> gradient_elevated(d + 1);
++  std::vector<DType> gradient_local_barycentric(d + 2);
++
++  DType inv_std_dev = sqrt(2.0 / 3.0) * (d + 1);
++  for (int i = 0; i < d; i++) {
++    scale_factor[i] = 1.0 / sqrt((i + 2) * (i + 1)) * inv_std_dev;
++  }
++
++  for (int k = 0; k < N; k++) {
++    // Compute all vertices and their offset
++    for (int remainder = 0; remainder <= d; remainder++) {
++      gradient_local_barycentric[remainder] =
++          gradient_barycentric[k][remainder];
++    }
++
++    // Wrap around
++    gradient_local_barycentric[d + 1] = gradient_local_barycentric[0];
++
++    std::fill(gradient_elevated.begin(), gradient_elevated.end(), 0);
++
++    const float down_factor = 1.0f / (d + 1);
++    // Compute the barycentric coordinates (p.10 in [Adams etal 2010])
++    for (int i = 0; i <= d; i++) {
++      DType gradient_v = 0;
++      gradient_v -= gradient_local_barycentric[d - rank[k][i] + 1];
++      gradient_v += gradient_local_barycentric[d - rank[k][i]];
++      gradient_elevated[i] += down_factor * gradient_v;
++    }
++
++    // sm contains the sum of 1..n of our faeture vector
++    DType sm = gradient_elevated[0];
++
++    for (int j = 1; j <= d; j++) {
++      DType cf = sm;
++      sm += gradient_elevated[j];
++      cf -= j * gradient_elevated[j];
++      gradient_features[k][j - 1] += scale_factor[j - 1] * cf;
++    }
++  }
++}
++
++DMLC_REGISTER_PARAMETER(PermutohedralLatticeParam);
++DMLC_REGISTER_PARAMETER(PermutohedralSplatParam);
++DMLC_REGISTER_PARAMETER(PermutohedralSliceParam);
++DMLC_REGISTER_PARAMETER(PermutohedralConvolveParam);
++
++NNVM_REGISTER_OP(permutohedral_lattice)
++    .describe("Builds a permutohedral lattice." ADD_FILELINE)
++    .set_attr_parser(ParamParser<PermutohedralLatticeParam>)
++    .set_num_inputs(permutohedral::lattice::kNumInputs)
++    .set_num_outputs(permutohedral::lattice::kNumOutputs)
++    .set_attr<nnvm::FNumVisibleOutputs>(
++        "FNumVisibleOutputs",
++        [](const NodeAttrs& attrs) {
++          return permutohedral::lattice::kNumOutputs - 1;
++        })
++    .set_attr<nnvm::FListInputNames>("FListInputNames",
++                                     [](const NodeAttrs& attrs) {
++                                       return std::vector<std::string>{
++                                           "features"};
++                                     })
++    .set_attr<nnvm::FListOutputNames>("FListOutputNames",
++                                      [](const NodeAttrs& attrs) {
++                                        return std::vector<std::string>{
++                                            "barycentric", "offset",
++                                            "blur_neighbors"};
++                                      })
++    .set_attr<nnvm::FInferShape>("FInferShape", PermutohedralLatticeShape)
++    .set_attr<nnvm::FInferType>("FInferType", PermutohedralLatticeType)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralLatticeForward<cpu>)
++    .set_attr<nnvm::FGradient>("FGradient",
++                               ElemwiseGradUseInOut{
++                                   "_backward_permutohedral_lattice"})
++    .add_argument("features",
++                  "NDArray-or-Symbol",
++                  "Input features to the permutohedral convolution.")
++    .add_arguments(PermutohedralLatticeParam::__FIELDS__());
++
++NNVM_REGISTER_OP(permutohedral_splat)
++    .describe(
++        "Applies a splatting operation on the permutohedral "
++        "lattice." ADD_FILELINE)
++    .set_attr_parser(ParamParser<PermutohedralSplatParam>)
++    .set_num_inputs(permutohedral::splat::kNumInputs)
++    .set_num_outputs(permutohedral::splat::kNumOutputs)
++    .set_attr<nnvm::FNumVisibleOutputs>(
++        "FNumVisibleOutputs",
++        [](const NodeAttrs& attrs) {
++          return permutohedral::splat::kNumOutputs;
++        })
++    .set_attr<nnvm::FListInputNames>(
++        "FListInputNames",
++        [](const NodeAttrs& attrs) {
++          return std::vector<std::string>{"data_in", "barycentric", "offset"};
++        })
++    .set_attr<nnvm::FListInputNames>("FListOutputNames",
++                                     [](const NodeAttrs& attrs) {
++                                       return std::vector<std::string>{
++                                           "data_out"};
++                                     })
++    .set_attr<nnvm::FInferShape>("FInferShape", PermutohedralSplatShape)
++    .set_attr<nnvm::FInferType>("FInferType", PermutohedralSplatType)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralSplatForward<cpu>)
++    .set_attr<nnvm::FGradient>("FGradient",
++                               ElemwiseGradUseInOut{
++                                   "_backward_permutohedral_splat"})
++    .add_argument("data_in",
++                  "NDArray-or-Symbol",
++                  "Input data to the splatting opteration.")
++    .add_argument("barycentric",
++                  "NDArray-or-Symbol",
++                  "Barycentric coordinates of the permutohedral lattice.")
++    .add_argument("offset",
++                  "NDArray-or-Symbol",
++                  "Offset matrix of the permutohedral lattice.")
++    .add_arguments(PermutohedralSplatParam::__FIELDS__());
++
++NNVM_REGISTER_OP(permutohedral_slice)
++    .describe(
++        "Applies a slicing operation on the permutohedral "
++        "lattice." ADD_FILELINE)
++    .set_attr_parser(ParamParser<PermutohedralSliceParam>)
++    .set_num_inputs(permutohedral::slice::kNumInputs)
++    .set_num_outputs(permutohedral::slice::kNumOutputs)
++    .set_attr<nnvm::FNumVisibleOutputs>(
++        "FNumVisibleOutputs",
++        [](const NodeAttrs& attrs) {
++          return permutohedral::slice::kNumOutputs;
++        })
++    .set_attr<nnvm::FListInputNames>(
++        "FListInputNames",
++        [](const NodeAttrs& attrs) {
++          return std::vector<std::string>{"data_in", "barycentric", "offset"};
++        })
++    .set_attr<nnvm::FListInputNames>("FListOutputNames",
++                                     [](const NodeAttrs& attrs) {
++                                       return std::vector<std::string>{
++                                           "data_out"};
++                                     })
++    .set_attr<nnvm::FInferShape>("FInferShape", PermutohedralSliceShape)
++    .set_attr<nnvm::FInferType>("FInferType", PermutohedralSliceType)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralSliceForward<cpu>)
++    .set_attr<nnvm::FGradient>("FGradient",
++                               ElemwiseGradUseInOut{
++                                   "_backward_permutohedral_slice"})
++    .add_argument("data_in",
++                  "NDArray-or-Symbol",
++                  "Input data to the splatting opteration.")
++    .add_argument("barycentric",
++                  "NDArray-or-Symbol",
++                  "Barycentric coordinates of the permutohedral lattice.")
++    .add_argument("offset",
++                  "NDArray-or-Symbol",
++                  "Offset matrix of the permutohedral lattice.")
++    .add_arguments(PermutohedralSliceParam::__FIELDS__());
++
++NNVM_REGISTER_OP(permutohedral_convolve)
++    .describe(
++        "Applies a convolution on the permutohedral lattice." ADD_FILELINE)
++    .set_attr_parser(ParamParser<PermutohedralConvolveParam>)
++    .set_num_inputs(permutohedral::convolve::kNumInputs)
++    .set_num_outputs(permutohedral::convolve::kNumOutputs)
++    .set_attr<nnvm::FNumVisibleOutputs>(
++        "FNumVisibleOutputs",
++        [](const NodeAttrs& attrs) {
++          return permutohedral::convolve::kNumOutputs;
++        })
++    .set_attr<nnvm::FListInputNames>("FListInputNames",
++                                     [](const NodeAttrs& attrs) {
++                                       return std::vector<std::string>{
++                                           "data_in", "weight",
++                                           "blur_neighbors"};
++                                     })
++    .set_attr<nnvm::FListInputNames>("FListOutputNames",
++                                     [](const NodeAttrs& attrs) {
++                                       return std::vector<std::string>{
++                                           "data_out"};
++                                     })
++    .set_attr<nnvm::FInferShape>("FInferShape", PermutohedralConvolveShape)
++    .set_attr<nnvm::FInferType>("FInferType", PermutohedralConvolveType)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralConvolveForward<cpu>)
++    .set_attr<FResourceRequest>("FResourceRequest",
++                                [](const NodeAttrs& attrs) {
++                                  return std::vector<ResourceRequest>{
++                                      ResourceRequest::kTempSpace};
++                                })
++    .set_attr<nnvm::FGradient>("FGradient",
++                               ElemwiseGradUseInOut{
++                                   "_backward_permutohedral_convolve"})
++    .add_argument("data_in",
++                  "NDArray-or-Symbol",
++                  "Input data to the permutohedral convolution.")
++    .add_argument("weight", "NDArray-or-Symbol", "Filter matrix.")
++    .add_argument("blur_neighbors",
++                  "NDArray-or-Symbol",
++                  "Blur neighbor matrix of the permutohedral lattice.")
++    .add_arguments(PermutohedralConvolveParam::__FIELDS__());
++
++NNVM_REGISTER_OP(_backward_permutohedral_lattice)
++    .set_attr_parser(ParamParser<PermutohedralLatticeParam>)
++    .set_num_inputs(permutohedral::lattice::kNumOutputs +
++                    permutohedral::lattice::kNumInputs +
++                    permutohedral::lattice::kNumOutputs)
++    .set_num_outputs(permutohedral::lattice::kNumInputs)
++    .set_attr<nnvm::TIsBackward>("TIsBackward", true)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralLatticeBackward<cpu>);
++
++NNVM_REGISTER_OP(_backward_permutohedral_splat)
++    .set_attr_parser(ParamParser<PermutohedralSplatParam>)
++    .set_num_inputs(permutohedral::splat::kNumOutputs +
++                    permutohedral::splat::kNumInputs +
++                    permutohedral::splat::kNumOutputs)
++    .set_num_outputs(permutohedral::splat::kNumInputs)
++    .set_attr<nnvm::TIsBackward>("TIsBackward", true)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralSplatBackward<cpu>);
++
++NNVM_REGISTER_OP(_backward_permutohedral_slice)
++    .set_attr_parser(ParamParser<PermutohedralSliceParam>)
++    .set_num_inputs(permutohedral::slice::kNumOutputs +
++                    permutohedral::slice::kNumInputs +
++                    permutohedral::slice::kNumOutputs)
++    .set_num_outputs(permutohedral::slice::kNumInputs)
++    .set_attr<nnvm::TIsBackward>("TIsBackward", true)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralSliceBackward<cpu>);
++
++NNVM_REGISTER_OP(_backward_permutohedral_convolve)
++    .set_attr_parser(ParamParser<PermutohedralConvolveParam>)
++    .set_num_inputs(permutohedral::convolve::kNumOutputs +
++                    permutohedral::convolve::kNumInputs +
++                    permutohedral::convolve::kNumOutputs)
++    .set_num_outputs(permutohedral::convolve::kNumInputs)
++    .set_attr<nnvm::TIsBackward>("TIsBackward", true)
++    .set_attr<FCompute>("FCompute<cpu>", PermutohedralConvolveBackward<cpu>)
++    .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs) {
++      return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
++    });
++}  // namespace op
++}  // namespace mxnet
+diff --git a/src/operator/permutohedral.cu b/src/operator/permutohedral.cu
+new file mode 100644
+index 0000000..24487f5
+--- /dev/null
++++ b/src/operator/permutohedral.cu
+@@ -0,0 +1,351 @@
++// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#include "./permutohedral-inl.h"
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++#include "./linalg.h"
++
++namespace mxnet {
++namespace op {
++
++NNVM_REGISTER_OP(permutohedral_convolve)
++    .set_attr<FCompute>("FCompute<gpu>", PermutohedralConvolveForward<gpu>);
++
++NNVM_REGISTER_OP(_backward_permutohedral_convolve)
++    .set_attr<FCompute>("FCompute<gpu>", PermutohedralConvolveBackward<gpu>);
++
++template <typename DType>
++__global__ void im2col_gpu_kernel(const DType* im,
++                                  const int value_size,
++                                  const int filter_size,
++                                  const int lattice_size,
++                                  const int start,
++                                  const int output_size,
++                                  const int* blur_neighbors,
++                                  DType* col) {
++  for (int i = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
++       i < output_size; i += blockDim.x * gridDim.x * gridDim.y) {
++    for (int k = 0; k < value_size; ++k) {
++      col[(k * filter_size + 0) * output_size + i] =
++          im[k * (lattice_size + 1) + (i + start + 1)];
++
++      for (int f = 1; f < filter_size; ++f) {
++        const int* neighbors =
++            &blur_neighbors[(i + start) * (filter_size - 1) + 0];
++
++        col[(k * filter_size + f) * output_size + i] =
++            im[k * (lattice_size + 1) + (neighbors[f - 1] + 1)];
++      }
++    }
++  }
++}
++
++template <typename DType>
++__global__ void col2im_gpu_kernel(const DType* col,
++                                  const int value_size,
++                                  const int filter_size,
++                                  const int lattice_size,
++                                  const int start,
++                                  const int output_size,
++                                  const int* blur_neighbors,
++                                  DType* im) {
++  for (int i = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
++       i < output_size; i += blockDim.x * gridDim.x * gridDim.y) {
++    for (std::size_t k = 0; k < value_size; ++k) {
++      atomicAdd(&im[k * (lattice_size + 1) + (i + start + 1)],
++                col[(k * filter_size + 0) * output_size + i]);
++
++      for (std::size_t f = 1; f < filter_size; ++f) {
++        const int* neighbors =
++            &blur_neighbors[(i + start) * (filter_size - 1) + 0];
++
++        atomicAdd(&im[k * (lattice_size + 1) + (neighbors[f - 1] + 1)],
++                  col[(k * filter_size + f) * output_size + i]);
++      }
++    }
++  }
++}
++
++// im             value_size x (lattice_size+1)                     row-major
++// blur_neighbors lattice_size x (filter_size-1)                    row-major
++// col            value_size * filter_size x (end - start)          row-major
++template <typename xpu, typename DType>
++void im2col(const Tensor<xpu, 2, DType>& im,
++            const index_t value_size,
++            const index_t filter_size,
++            const index_t lattice_size,
++            const index_t start,
++            const index_t end,
++            const Tensor<xpu, 2, int32_t>& blur_neighbors,
++            Tensor<xpu, 2, DType> col) {
++  const int output_size = end - start;
++
++  DType* col_ptr = col.dptr_;
++  const DType* im_ptr = im.dptr_;
++  const int32_t* blur_neighbors_ptr = blur_neighbors.dptr_;
++
++  using namespace cuda;
++  const int max_block =
++      (output_size + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
++  dim3 num_blocks(kMaxGridDim, (max_block + kMaxGridDim - 1) / kMaxGridDim);
++  dim3 threads_per_block(kMaxThreadsPerBlock);
++  CheckLaunchParam(num_blocks, threads_per_block, "im2col");
++  cudaStream_t stream = Stream<gpu>::GetStream(col.stream_);
++  im2col_gpu_kernel<DType><<<num_blocks, threads_per_block, 0, stream>>>(
++      im_ptr, value_size, filter_size, lattice_size, start, output_size,
++      blur_neighbors_ptr, col_ptr);
++}
++
++// col            value_size * filter_size x (end - start)          row-major
++// blur_neighbors lattice_size x (filter_size-1)                    row-major
++// im             value_size x (lattice_size+1)                     row-major
++template <typename xpu, typename DType>
++void col2im(const Tensor<xpu, 2, DType>& col,
++            const index_t value_size,
++            const index_t filter_size,
++            const index_t lattice_size,
++            const index_t start,
++            const index_t end,
++            const Tensor<xpu, 2, int32_t>& blur_neighbors,
++            Tensor<xpu, 2, DType> im) {
++  const int output_size = end - start;
++
++  const DType* col_ptr = col.dptr_;
++  DType* im_ptr = im.dptr_;
++  const int32_t* blur_neighbors_ptr = blur_neighbors.dptr_;
++
++  using namespace cuda;
++  const int max_block =
++      (output_size + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
++  dim3 num_blocks(kMaxGridDim, (max_block + kMaxGridDim - 1) / kMaxGridDim);
++  dim3 threads_per_block(kMaxThreadsPerBlock);
++  CheckLaunchParam(num_blocks, threads_per_block, "col2im");
++  cudaStream_t stream = Stream<gpu>::GetStream(col.stream_);
++  col2im_gpu_kernel<DType><<<num_blocks, threads_per_block, 0, stream>>>(
++      col_ptr, value_size, filter_size, lattice_size, start, output_size,
++      blur_neighbors_ptr, im_ptr);
++}
++
++// filter         groups x num_filter / groups
++//                x value_size / groups * filter_size           row-major
++// splatted       value_size x (lattice_size+1)                 row-major
++// blur_neighbors lattice_size x (filter_size-1)                row-major
++// blurred        num_filter x (lattice_size+1)                 row-major
++// col_data       value_size / groups * filter_size
++//                x lattice_size                                row-major
++template <typename xpu, typename DType>
++void blur(const Tensor<xpu, 2, DType>& splatted,
++          const Tensor<xpu, 3, DType>& filter,
++          const Tensor<xpu, 2, int32_t>& blur_neighbors,
++          Tensor<xpu, 2, DType> col_data,
++          Tensor<xpu, 2, DType> blurred,
++          Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t lattice_size = blurred.shape_[1] - 1;
++  const index_t value_size = splatted.shape_[0];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  blurred = scalar<DType>(0);
++
++  // Parameters added for consistency with earlier implementation and possible
++  // later changes. If start/end are used for chunking, size of col_data needs
++  // to be adjusted accordingly.
++  const index_t start = 0;
++  const index_t end = lattice_size;
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(blurred.shape_[0], lattice_size);
++  Tensor<xpu, 2, DType> blurred_help(blurred.dptr_ + 1, help_shape,
++                                     lattice_size + 1, s);
++
++  // TODO(annewann): Add loop over chunks if necessary.
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(
++        splatted.Slice(value_size / groups * g, value_size / groups * (g + 1)),
++        value_size / groups, filter_size, lattice_size, start, end,
++        blur_neighbors, col_data);
++
++    linalg_gemm<gpu, DType>(filter[g], col_data,
++                            blurred_help.Slice(g * M, (g + 1) * M), 1, 0, false,
++                            false, s);
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size    row-major
++// gradient_splatted value_size x (lattice_size+1)          row-major
++// blur_neighbors    lattice_size x (filter_size-1)         row-major
++// gradient_blurred  num_filter x (lattice_size+1)          row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                         row-major
++// splatted and gradient_splatted can be the same tensor.
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x lattice_size.
++template <typename xpu, typename DType>
++void blur_tick(const Tensor<xpu, 2, DType>& splatted,
++               const Tensor<xpu, 2, DType>& gradient_blurred,
++               const Tensor<xpu, 3, DType>& filter,
++               const Tensor<xpu, 2, int32_t>& blur_neighbors,
++               Tensor<xpu, 2, DType> col_data,
++               Tensor<xpu, 3, DType> gradient_filter,
++               Tensor<xpu, 2, DType> gradient_splatted,
++               Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t lattice_size = gradient_blurred.shape_[1] - 1;
++  const index_t value_size = splatted.shape_[0];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  // Parameters added for consistency with earlier implementation and possible
++  // later changes. If start/end are used for chunking, size of col_data needs
++  // to be adjusted accordingly.
++  const index_t start = 0;
++  const index_t end = lattice_size;
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], lattice_size);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, lattice_size + 1, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(
++        splatted.Slice(value_size / groups * g, value_size / groups * (g + 1)),
++        value_size / groups, filter_size, lattice_size, start, end,
++        blur_neighbors, col_data);
++
++    // Gradient w.r.t. filter.
++    linalg_gemm<xpu, DType>(gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, gradient_filter[g], 1, 1, false, true, s);
++    // Gradient w.r.t. data.
++    linalg_gemm<xpu, DType>(filter[g],
++                            gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, 1, 0, true, false, s);
++
++    gradient_splatted.Slice(value_size / groups * g,
++                            value_size / groups * (g + 1)) = scalar<DType>(0);
++
++    col2im<xpu, DType>(col_data, value_size / groups, filter_size, lattice_size,
++                       start, end, blur_neighbors,
++                       gradient_splatted.Slice(value_size / groups * g,
++                                               value_size / groups * (g + 1)));
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size    row-major
++// blur_neighbors    lattice_size x (filter_size-1)         row-major
++// gradient_blurred  num_filter x (lattice_size+1)          row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                         row-major
++// splatted and gradient_splatted can be the same tensor.
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x lattice_size.
++template <typename xpu, typename DType>
++void blur_tick_weight(const Tensor<xpu, 2, DType>& splatted,
++                      const Tensor<xpu, 2, DType>& gradient_blurred,
++                      const Tensor<xpu, 3, DType>& filter,
++                      const Tensor<xpu, 2, int32_t>& blur_neighbors,
++                      Tensor<xpu, 2, DType> col_data,
++                      Tensor<xpu, 3, DType> gradient_filter,
++                      Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t lattice_size = gradient_blurred.shape_[1] - 1;
++  const index_t value_size = splatted.shape_[0];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  // Parameters added for consistency with earlier implementation and possible
++  // later changes. If start/end are used for chunking, size of col_data needs
++  // to be adjusted accordingly.
++  const index_t start = 0;
++  const index_t end = lattice_size;
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], lattice_size);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, lattice_size + 1, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(
++        splatted.Slice(value_size / groups * g, value_size / groups * (g + 1)),
++        value_size / groups, filter_size, lattice_size, start, end,
++        blur_neighbors, col_data);
++
++    // Gradient w.r.t. filter.
++    linalg_gemm<xpu, DType>(gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, gradient_filter[g], 1, 1, false, true, s);
++  }
++}
++
++// filter            groups x num_filter / groups
++//                   x value_size / groups * filter_size    row-major
++// gradient_splatted value_size x (lattice_size+1)          row-major
++// blur_neighbors    lattice_size x (filter_size-1)         row-major
++// gradient_blurred  num_filter x (lattice_size+1)          row-major
++// col_data          value_size / groups * filter_size
++//                   x lattice_size                         row-major
++// splatted and gradient_splatted can be the same tensor.
++// TODO(mkiefel): Implement chunking for the large col_data tensor.
++// TODO(mkiefel): Check if there is a nice way to reshape gradient_blurred to
++//                groups x num_filter / groups x lattice_size.
++template <typename xpu, typename DType>
++void blur_tick_data(const Tensor<xpu, 2, DType>& splatted,
++               const Tensor<xpu, 2, DType>& gradient_blurred,
++               const Tensor<xpu, 3, DType>& filter,
++               const Tensor<xpu, 2, int32_t>& blur_neighbors,
++               Tensor<xpu, 2, DType> col_data,
++               Tensor<xpu, 2, DType> gradient_splatted,
++               Stream<xpu>* s) {
++  const index_t groups = filter.shape_[0];
++  const index_t M = filter.shape_[1];
++  const index_t K = filter.shape_[2];
++  const index_t lattice_size = gradient_blurred.shape_[1] - 1;
++  const index_t value_size = splatted.shape_[0];
++  const index_t filter_size = blur_neighbors.shape_[1] + 1;
++
++  // Parameters added for consistency with earlier implementation and possible
++  // later changes. If start/end are used for chunking, size of col_data needs
++  // to be adjusted accordingly.
++  const index_t start = 0;
++  const index_t end = lattice_size;
++
++  // Define help tensor to leave first column of gradient_blurred unchanged.
++  Shape<2> help_shape = Shape2(gradient_blurred.shape_[0], lattice_size);
++  Tensor<xpu, 2, DType> gradient_blurred_help(gradient_blurred.dptr_ + 1,
++                                              help_shape, lattice_size + 1, s);
++
++  for (index_t g = 0; g < groups; ++g) {
++    im2col(
++        splatted.Slice(value_size / groups * g, value_size / groups * (g + 1)),
++        value_size / groups, filter_size, lattice_size, start, end,
++        blur_neighbors, col_data);
++
++    // Gradient w.r.t. data.
++    linalg_gemm<xpu, DType>(filter[g],
++                            gradient_blurred_help.Slice(g * M, (g + 1) * M),
++                            col_data, 1, 0, true, false, s);
++
++    gradient_splatted.Slice(value_size / groups * g,
++                            value_size / groups * (g + 1)) = scalar<DType>(0);
++
++    col2im<xpu, DType>(col_data, value_size / groups, filter_size, lattice_size,
++                       start, end, blur_neighbors,
++                       gradient_splatted.Slice(value_size / groups * g,
++                                               value_size / groups * (g + 1)));
++  }
++}
++
++}  // namespace op
++}  // namespace mxnet
+diff --git a/tests/python/unittest/test_operator.py b/tests/python/unittest/test_operator.py
+index 640cd34..540d0f4 100644
+--- a/tests/python/unittest/test_operator.py
++++ b/tests/python/unittest/test_operator.py
+@@ -3864,6 +3864,316 @@ def test_deformable_psroipooling():
+                                                grad_nodes=grad_nodes, ctx=mx.gpu(0))
+ 
+ 
++def test_permutohedral():
++    np.random.seed(42)
++    test_shape = (5, )
++    lattice_size = 30
++
++    data_in = mx.symbol.Variable("data_in")
++    data_normalization = mx.symbol.Variable("data_normalization")
++    data_normalization = mx.sym.BlockGrad(data_normalization)
++    features = mx.symbol.Variable("features")
++    weight = mx.symbol.Variable("weight")
++    barycentric, offset, blurNeighbors = mx.sym.permutohedral_lattice(
++        features, neighborhood_size=0, lattice_size=lattice_size)
++    data_lattice = mx.sym.permutohedral_splat(
++        data_in,
++        barycentric,
++        offset,
++        features_in_offset=0,
++        features_in_size=np.prod(test_shape),
++        lattice_size=lattice_size)
++    data_blurred = mx.sym.permutohedral_convolve(data_lattice,
++                                                 weight,
++                                                 blurNeighbors,
++                                                 num_filter=1,
++                                                 groups=1)
++    data_out = mx.sym.permutohedral_slice(
++        data_blurred,
++        barycentric,
++        offset,
++        features_out_offset=0,
++        features_out_size=np.prod(test_shape))
++
++    normalization = mx.sym.permutohedral_splat(
++        data_normalization,
++        barycentric,
++        offset,
++        features_in_offset=0,
++        features_in_size=np.prod(test_shape),
++        lattice_size=lattice_size)
++    normalization = mx.sym.permutohedral_slice(
++        normalization,
++        barycentric,
++        offset,
++        features_out_offset=0,
++        features_out_size=np.prod(test_shape))
++
++    data_out = data_out / normalization
++
++    for dtype in [np.float16, np.float32, np.float64]:
++        if dtype is np.float16:
++            rtol = 1e-2
++            atol = 1e-4
++        else:
++            rtol = 1e-3
++            atol = 1e-4
++
++        data_in_array = np.zeros((1,1,)+test_shape)
++        data_in_array[0, 0, test_shape[0] // 2] = 1.0
++
++        features_array = np.linspace(-10, 10,
++                                    test_shape[0])[np.newaxis, :, np.newaxis]
++        weight_array = np.random.random((1, 1, 1))
++
++        data_normalization_array = np.ones((1, 1,) + test_shape)
++
++        data_out_array = weight_array * data_in_array
++
++        check_symbolic_forward(
++            data_out, {'features': features_array, 'data_in': data_in_array,
++                       'weight': weight_array,
++                       'data_normalization': data_normalization_array},
++            [data_out_array],
++            rtol=rtol,
++            atol=atol)
++        check_numeric_gradient(
++            data_out, {'features': features_array, 'data_in': data_in_array,
++                       'weight': weight_array,
++                       'data_normalization': data_normalization_array},
++            grad_nodes=['features', 'data_in', 'weight'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++
++def test_permutohedral_lattice_gradient():
++    test_shape = (11, )
++    features = mx.symbol.Variable("features")
++    barycentric, offset, blurNeighbors = mx.sym.permutohedral_lattice(
++        features, neighborhood_size=3, lattice_size=20)
++    for dtype in [np.float16, np.float32, np.float64]:
++        if dtype is np.float16:
++            rtol = 1e-2
++            atol = 1e-4
++        else:
++            rtol = 1e-3
++            atol = 1e-5
++
++        features_array = np.linspace(-1, 1,
++                                     test_shape[0])[np.newaxis, :, np.newaxis]
++
++        check_numeric_gradient(
++            barycentric, [features_array],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++
++def test_permutohedral_lattice():
++    """Tests lattice structure against non-MXNet reference implementation.
++
++    Creates a test case with three points with two-dimensional features.
++    """
++    features = np.array([[[-0.74277345520456495, 0.47860371061205509],
++                          [-0.92089192272408638, -0.83576270592866453],
++                          [-0.21193358317350244, 0.63877616552014738]]])
++
++    barycentric, offset, blur_neighbors = mx.nd.permutohedral_lattice(
++        mx.nd.array(features), neighborhood_size=2, lattice_size=7)
++
++    barycentric_expected = np.array(
++        [[[0.092133185347870628, 0.051340606571980751, 0.85652620808014857],
++          [0.30366285671855087, 0.63413744486122181, 0.062199698420227267],
++          [0.23844127345349864, 0.51799360449379339, 0.24356512205270786]]])
++    assert_allclose(barycentric.asnumpy(), barycentric_expected, rtol=1e-5)
++
++    offset_expected = np.array([[0, 1, 2], [3, 4, 5], [0, 1, 2]], dtype=int)
++    assert np.all(offset.asnumpy() == offset_expected)
++
++    blur_neighbors_expected = np.array(
++        [[-1, 0, 4, -1, 3, -1, -1],
++         [-1, -1, 3, -1, -1, -1, -1],
++         [2, -1, -1, 5, -1, -1, -1],
++         [4, -1, -1, -1, -1, -1, -1],
++         [3, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, 1, -1, 0, 4, -1],
++         [-1, -1, 0, -1, -1, 3, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, 2, -1, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, 0, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, -1, -1],
++         [-1, -1, -1, -1, -1, 2, -1],
++         [-1, -1, -1, -1, -1, -1, -1]]).transpose()
++    assert np.all(blur_neighbors.asnumpy() == blur_neighbors_expected)
++
++
++def test_permutohedral_splat():
++    np.random.seed(42)
++    test_shape = (11,)
++    lattice_size = 20
++
++    data_in = mx.symbol.Variable("data_in")
++    barycentric = mx.symbol.Variable("barycentric")
++    offset = mx.symbol.Variable("offset")
++    offset = mx.sym.BlockGrad(offset)
++    data_lattice = mx.sym.permutohedral_splat(
++        data_in,
++        barycentric,
++        offset,
++        features_in_offset=1,
++        features_in_size=test_shape[0],
++        lattice_size=lattice_size)
++    for dtype in [np.float16, np.float32, np.float64]:
++        if dtype is np.float16:
++            rtol = 1e-2
++            atol = 1e-4
++        else:
++            rtol = 1e-3
++            atol = 1e-5
++
++        data_in_array = np.random.random((1, 2,) + test_shape)
++        barycentric_array1 = 0.5 * np.random.random((1, test_shape[0] * 2, 1))
++        barycentric_array2 = 0.5 * np.random.random((1, test_shape[0] * 2, 1))
++        barycentric_array = np.concatenate((barycentric_array1,
++                                            barycentric_array2,
++                                            1. - (barycentric_array1 +
++                                            barycentric_array2)), axis=2)
++        offset_array = np.random.randint(0, lattice_size,
++                                         size=(1, test_shape[0] * 2, 3),
++                                         dtype=np.int32)
++
++        check_numeric_gradient(
++            data_lattice, [data_in_array, barycentric_array, offset_array],
++            grad_nodes=['data_in', 'barycentric'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_lattice, [data_in_array, barycentric_array, offset_array],
++            grad_nodes=['barycentric'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_lattice, [data_in_array, barycentric_array, offset_array],
++            grad_nodes=['data_in'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++
++def test_permutohedral_slice():
++    np.random.seed(42)
++    test_shape = (11,)
++    lattice_size = 20
++
++    data_lattice = mx.symbol.Variable("data_lattice")
++    barycentric = mx.symbol.Variable("barycentric")
++    offset = mx.symbol.Variable("offset")
++    offset = mx.sym.BlockGrad(offset)
++    data_out = mx.sym.permutohedral_slice(
++        data_lattice,
++        barycentric,
++        offset,
++        features_out_offset=5,
++        features_out_size=test_shape[0])
++    for dtype in [np.float16, np.float32, np.float64]:
++        if dtype is np.float16:
++            rtol = 1e-2
++            atol = 1e-4
++        else:
++            rtol = 1e-3
++            atol = 1e-5
++
++        data_lattice_array = np.random.random((1, 1, lattice_size + 1))
++        barycentric_array = np.random.rand(1, test_shape[0] * 2, 1)
++        barycentric_array = np.concatenate((barycentric_array,
++                                            1. - barycentric_array), axis=2)
++        offset_array = np.random.randint(0, lattice_size,
++                                         size=(1, test_shape[0] * 2, 2),
++                                         dtype='int32')
++
++        check_numeric_gradient(
++            data_out, [data_lattice_array, barycentric_array, offset_array],
++            grad_nodes=['data_lattice', 'barycentric'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_out, [data_lattice_array, barycentric_array, offset_array],
++            grad_nodes=['barycentric'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_out, [data_lattice_array, barycentric_array, offset_array],
++            grad_nodes=['data_lattice'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++
++def test_permutohedral_convolve():
++    np.random.seed(42)
++    lattice_size = 20
++
++    data_lattice = mx.symbol.Variable("data_lattice")
++    weight = mx.symbol.Variable("weight")
++    blurNeighbors = mx.symbol.Variable("blurNeighbors")
++    blurNeighbors = mx.sym.BlockGrad(blurNeighbors)
++    data_blurred = mx.sym.permutohedral_convolve(data_lattice,
++                                                weight,
++                                                blurNeighbors,
++                                                num_filter=6,
++                                                groups=2)
++    for dtype in [np.float16, np.float32, np.float64]:
++        if dtype is np.float16:
++            rtol = 1e-2
++            atol = 1e-4
++        else:
++            rtol = 1e-3
++            atol = 1e-5
++
++        data_lattice_array = np.random.random((1, 2, lattice_size + 1))
++        weight_array = np.random.rand(2, 3, 3)
++        blurNeighbors_array = np.random.randint(0, lattice_size,
++                                         size=(1, lattice_size, 2),
++                                         dtype='int32')
++
++        check_numeric_gradient(
++            data_blurred, [data_lattice_array, weight_array, blurNeighbors_array],
++            grad_nodes=['data_lattice', 'weight'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_blurred,
++            [data_lattice_array, weight_array, blurNeighbors_array],
++            grad_nodes=['weight'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++        check_numeric_gradient(
++            data_blurred,
++            [data_lattice_array, weight_array, blurNeighbors_array],
++            grad_nodes=['data_lattice'],
++            numeric_eps=1e-3,
++            rtol=rtol,
++            atol=atol)
++
++
+ # Helper functions for test_laop
+ 
+ def _make_symm_symbol(a, ndims):
+-- 
+2.7.4
+
